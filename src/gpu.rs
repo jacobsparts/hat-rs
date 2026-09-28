@@ -696,14 +696,12 @@ impl<'a> Gpu<'a> {
         }
         self.cuda.oca_label(&a.loca, nw, nx, plan.win, plan.owin, plan.opad(), h, w)?;
         // The relative-position bias for the overlapping attention is NOT gathered:
-        // that attention has no bias (see `ocab`). The small-window one is.
-        // THE RELATIVE-POSITION BIAS IS NOT GATHERED HERE, and that used to be a bug.
-        // The gathered `[heads][nq][nk]` addend belongs to ONE TABLE, and the checkpoint
-        // stores 42 of them - one per HAB, one per OCAB - with identical shapes and
-        // similar magnitudes. Gathering block 0's once and reusing it for all 36 HABs
-        // left block 0 of stage 0 exact to 1.2e-6 while every later block was wrong by
-        // ~2e-2: a bug that survives a whole verification run. `hab` now gathers per
-        // block from ITS OWN table.
+        // that attention has no bias (see `ocab`). Every HAB's IS, and it is gathered
+        // PER BLOCK rather than once here - a gathered `[heads][nq][nk]` addend belongs
+        // to ONE table, and the checkpoint stores 42 of them with identical SHAPES and
+        // similar magnitudes. Gathering block 0's once and reusing it left block 0 of
+        // stage 0 exact to 1.2e-6 while every later block was wrong by ~2e-2, which is
+        // a bug that survives a whole verification run.
         //
         // What is built here is only the part that depends on the PLAN rather than the
         // weights: the two label grids. The index maps are in `Acts::new`, because they
