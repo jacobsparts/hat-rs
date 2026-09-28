@@ -16,7 +16,7 @@ struct Args {
     input: Option<String>,
     output: Option<String>,
     verify: Option<String>,
-    device: String,
+    device: Option<String>,
     list_weights: bool,
     /// `--cuda-selftest`: check every project CUDA kernel against its host twin.
     /// Requires no model - it runs on synthetic inputs.
@@ -31,7 +31,7 @@ fn usage() -> &'static str {
     "hat - HAT super-resolution (S/M/L, x2/x3/x4)
 
 USAGE:
-    hat -m <model.safetensors> -i <in.png> -o <out.png> [--device cpu]
+    hat -m <model.safetensors> -i <in.png> -o <out.png> [--device cpu|gpu]
     hat -m <model.safetensors> --verify <fixture.bin>
     hat -m <model.safetensors> --list-weights
     hat --cuda-selftest
@@ -43,7 +43,9 @@ OPTIONS:
         --verify <path>   compare a backend against a golden fixture and report the
                           worst and mean absolute difference; exits 1 if it is over
                           the tolerance, so it can be used as a test
-        --device <name>   cpu (default) or gpu
+        --device <name>   cpu or gpu; left out, the GPU is used when the CUDA driver
+                          can be brought up and the CPU path when it cannot, and
+                          `--device gpu` typed by hand refuses that fallback
         --list-weights    print every tensor the checkpoint holds, with its shape
         --cuda-selftest   check every project CUDA kernel against a host implementation
                           of the same operator, on seeded inputs (no -m needed); a
@@ -65,7 +67,7 @@ fn parse() -> Result<Args, String> {
         input: None,
         output: None,
         verify: None,
-        device: "cpu".to_string(),
+        device: None,
         list_weights: false,
         selftest: false,
         tile: None,
@@ -79,7 +81,7 @@ fn parse() -> Result<Args, String> {
             "-i" | "--input" => a.input = Some(next()?),
             "-o" | "--output" => a.output = Some(next()?),
             "--verify" => a.verify = Some(next()?),
-            "--device" => a.device = next()?,
+            "--device" => a.device = Some(next()?),
             "--list-weights" => a.list_weights = true,
             "--cuda-selftest" => a.selftest = true,
             "--tile" => {
@@ -100,6 +102,45 @@ fn parse() -> Result<Args, String> {
         return Err(format!("no model: -m is required\n\n{}", usage()));
     }
     Ok(a)
+}
+
+/// Resolves the device the run will actually use. Left unspecified, the GPU is
+/// used when the CUDA driver can be brought up and the CPU path when it cannot,
+/// so one binary covers a machine with no NVIDIA driver at all; `--device cpu`
+/// forces the CPU path and `--device gpu` refuses the fallback. A bad name is
+/// rejected here rather than in the dispatchers, so the tiled and untiled paths
+/// see the same answer.
+fn resolve_device(requested: &Option<String>) -> Result<&'static str, String> {
+    match requested.as_deref() {
+        Some("cpu") => Ok("cpu"),
+        Some("gpu") => {
+            #[cfg(feature = "cuda")]
+            { Ok("gpu") }
+            #[cfg(not(feature = "cuda"))]
+            { Err(device_error("gpu")) }
+        }
+        Some(other) => Err(device_error(other)),
+        None => Ok(auto_device()),
+    }
+}
+
+/// The unspecified case: the GPU when the driver is there, the CPU when it is
+/// not. The probe is the driver bring-up itself, not a heuristic, so the answer
+/// is the one the run would have got.
+#[cfg(feature = "cuda")]
+fn auto_device() -> &'static str {
+    match lightgpu::vm::device() {
+        Ok(_) => "gpu",
+        Err(_) => {
+            eprintln!("hat: no CUDA driver could be brought up; using the CPU path");
+            "cpu"
+        }
+    }
+}
+
+#[cfg(not(feature = "cuda"))]
+fn auto_device() -> &'static str {
+    "cpu"
 }
 
 fn main() -> ExitCode {
@@ -134,8 +175,13 @@ fn run(args: &Args) -> Result<(), String> {
         return Ok(());
     }
 
+    // Resolve the device once, after the early returns that do not need one:
+    // `--list-weights` reads the checkpoint and nothing else, so probing the
+    // driver for it would be work (and a stderr line) for no reason.
+    let device = resolve_device(&args.device)?;
+
     if let Some(path) = &args.verify {
-        return verify(&wt, &args.device, path);
+        return verify(&wt, device, path);
     }
 
     let (input, output) = match (&args.input, &args.output) {
@@ -164,16 +210,16 @@ fn run(args: &Args) -> Result<(), String> {
             }
             (None, None) => unreachable!("guarded by the outer if"),
         };
-        let (out, info) = tile_forward(&wt, &args.device, h, w, &img.data, tile, margin)?;
+        let (out, info) = tile_forward(&wt, device, h, w, &img.data, tile, margin)?;
         println!("  tiled {} into {} tiles ({}px cores, {}px margin, largest {}x{})",
                  format!("{}x{}", w, h), info.tiles, info.tile, info.margin,
                  info.largest.0, info.largest.1);
         out
     } else {
-        dispatch(&wt, &args.device, h, w, &img.data)?
+        dispatch(&wt, device, h, w, &img.data)?
     };
     let elapsed = t0.elapsed();
-    println!("  {} forward in {:.1} ms ({:.2} MP/s)", args.device,
+    println!("  {} forward in {:.1} ms ({:.2} MP/s)", device,
              elapsed.as_secs_f64() * 1e3,
              (w * h) as f64 / 1e6 / elapsed.as_secs_f64());
     let out = image::Image { w: w * wt.scale, h: h * wt.scale, data: planes };

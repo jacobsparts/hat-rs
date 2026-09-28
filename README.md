@@ -11,10 +11,11 @@ hat -m hat-s-x4.safetensors -i small.png -o large.png
 ```
 
 * Both backends in one executable: a pure-Rust CPU path and a CUDA path with
-  hand-written kernels. `--device cpu|gpu` picks between them, and the CPU is the
-  default because a GPU that has to be fed a pass it cannot hold is slower than
-  the CPU that can - a 64x64 image takes 1.4 s on the CPU and 0.26 s on the GPU,
-  512x512 takes 82 s and 8.6 s.
+  hand-written kernels. The GPU is used when the CUDA driver can be brought up
+  and the CPU path when it cannot, so one binary covers a machine with no NVIDIA
+  driver at all; `--device cpu` forces the CPU and `--device gpu` refuses the
+  fallback. The GPU is much the faster path: a 64x64 image takes 0.26 s there and
+  1.4 s on the CPU, 512x512 takes 8.6 s and 82 s.
 * 2.25 MiB binary (1.19 MiB without the CUDA feature), statically linked except
   `libc`, `libm` and `libgcc_s`. `libcuda.so.1` is loaded at run time, so no
   driver is needed on disk, and `--no-default-features` builds a binary with no
@@ -34,7 +35,7 @@ Prebuilt binary and the converted checkpoints are attached to the
 
 | asset | what it is |
 |---|---|
-| `hat-linux-x86_64` | the engine: x86-64 Linux with glibc >= 2.34 (Ubuntu 22.04+, Debian 12+, RHEL 9+). The CUDA kernels are compiled in for compute capability 6.1, 7.5 and 8.0; with no driver, `--device cpu` is the path |
+| `hat-linux-x86_64` | the engine: x86-64 Linux with glibc >= 2.34 (Ubuntu 22.04+, Debian 12+, RHEL 9+). The CUDA kernels are compiled in for compute capability 6.1, 7.5 and 8.0; with no driver it runs the CPU path |
 | `hat-s-x4.safetensors` | 4x, the small model - **speed** |
 | `hat-x4.safetensors` | 4x, the base model |
 | `hat-l-x4.safetensors` | 4x, the large model - **quality** |
@@ -89,7 +90,7 @@ hat --cuda-selftest
 hat - HAT super-resolution (S/M/L, x2/x3/x4)
 
 USAGE:
-    hat -m <model.safetensors> -i <in.png> -o <out.png> [--device cpu]
+    hat -m <model.safetensors> -i <in.png> -o <out.png> [--device cpu|gpu]
     hat -m <model.safetensors> --verify <fixture.bin>
     hat -m <model.safetensors> --list-weights
     hat --cuda-selftest
@@ -101,7 +102,9 @@ OPTIONS:
         --verify <path>   compare a backend against a golden fixture and report the
                           worst and mean absolute difference; exits 1 if it is over
                           the tolerance, so it can be used as a test
-        --device <name>   cpu (default) or gpu
+        --device <name>   cpu or gpu; left out, the GPU is used when the CUDA driver
+                          can be brought up and the CPU path when it cannot, and
+                          `--device gpu` typed by hand refuses that fallback
         --list-weights    print every tensor the checkpoint holds, with its shape
         --cuda-selftest   check every project CUDA kernel against a host implementation
                           of the same operator, on seeded inputs (no -m needed); a
