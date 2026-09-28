@@ -41,6 +41,7 @@ pub const TOOLKIT_KERNELS: &[&str] = &[
     "lg_layer_norm",
     "lg_channel_layer_norm",
     "lg_channel_affine",
+    "lg_extract_rows",
     "lg_channel_mean",
     "lg_channel_scale",
     "lg_sigmoid",
@@ -53,6 +54,7 @@ pub const TOOLKIT_KERNELS: &[&str] = &[
     "lg_copy",
     "lg_window_gather",
     "lg_window_scatter",
+    "lg_pixel_shuffle",
 ];
 
 /// This engine's own kernels, in `cuda/hat.cu`.
@@ -63,14 +65,15 @@ pub const TOOLKIT_KERNELS: &[&str] = &[
 /// before it. The score/softmax misalignment across a warp is a property of the
 /// window size and head count, and the two-window forms differ only in `nq`/`nk`.
 ///
-/// `hat_plane_block` is the only layout kernel the backend needs: the reference's
+/// THE CHANNEL-RANGE IDIOM IS THE TOOLKIT'S, not a kernel of ours: the reference's
 /// fused `Linear(c, 3c)` writes one `[3c][hw]` plane and q, k, v and `cat(k, v)`
 /// are CHANNEL RANGES of it, with the bias a range of the same fused vector - so
 /// there is no split kernel, no derived weight and no plane<->token transpose
 /// anywhere in the forward (every projection is `lg_f32_gemm_tiled` on a plane and
-/// every norm is `lg_channel_layer_norm`). `hat_pixel_shuffle` is separate because
-/// the toolkit's `lg_merge_2x2` is the ViT patch MERGE - four spatial neighbours
-/// concatenated onto the channel axis - which is the opposite direction.
+/// every norm is `lg_channel_layer_norm`). Those ranges are `lg_channel_affine`
+/// with the offset folded into the pointer, and the token-major split of the
+/// window attention's qkv is `lg_extract_rows` - three kernels here used to do
+/// that work and each was measured against the toolkit op before removal.
 const PROJECT_KERNELS: &[&str] = &[
     "hat_attention_d24",
     "hat_attention_d30",
@@ -78,12 +81,8 @@ const PROJECT_KERNELS: &[&str] = &[
     "hat_bias_gather",
     "hat_mask_build",
     "hat_window_index",
-    "hat_plane_block",
     "hat_plane_edges",
     "hat_oca_label",
-    "hat_token_range",
-    "hat_plane_bias",
-    "hat_pixel_shuffle",
 ];
 
 fn main() {

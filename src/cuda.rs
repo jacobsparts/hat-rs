@@ -254,18 +254,6 @@ impl Cuda {
         self.flat("lg_scale", n, &mut a)
     }
 
-    /// `lg_channel_affine(in, out, scale, shift, c, hw)` - a per-channel affine over
-    /// a plane. The GEMMs here fold their bias into the weights, so this is used
-    /// only where a bias has to be added to an existing plane (see `hat_plane_block`,
-    /// which does it while copying a channel range).
-    pub fn channel_affine(&self, inp: &DevBuf, out: &DevBuf, scale: &DevBuf, shift: &DevBuf,
-                          c: usize, hw: usize) -> Result<(), String> {
-        let mut a = Args::new();
-        a.ptr(inp.ptr).ptr(out.ptr).ptr(scale.ptr).ptr(shift.ptr)
-            .i32(c as i32).i32(hw as i32);
-        self.flat("lg_channel_affine", c * hw, &mut a)
-    }
-
     /// `lg_channel_mean(x, out, c, hw)` - `AdaptiveAvgPool2d(1)` over a plane, one
     /// block per channel.
     pub fn channel_mean(&self, x: &DevBuf, out: &DevBuf, c: usize, hw: usize) -> Result<(), String> {
@@ -427,24 +415,22 @@ impl Cuda {
         self.run(name, ((nw * heads) as u32, 1, 1), (nq as u32, 1, 1), 0, &mut a)
     }
 
-    /// `hat_plane_bias(plane, bias, c, hw)` - `plane[ch][p] += bias[ch]`, in place, the
-    /// bias a `gemm_tiled` cannot supply.
-    pub fn plane_bias(&self, plane: &DevBuf, bias: &DevBuf, c: usize, hw: usize)
-                      -> Result<(), String> {
-        let mut a = Args::new();
-        a.ptr(plane.ptr).ptr(bias.ptr).i32(c as i32).i32(hw as i32);
-        self.flat("hat_plane_bias", c * hw, &mut a)
-    }
-
-    /// `hat_token_range(dst, src, co, ci, c0, rows)` - `dst[r][ch] = src[r][c0+ch]`,
-    /// the token-major twin of `hat_plane_block`, for splitting the window attention's
-    /// fused `[rows][3c]` qkv projection into q, k and v.
+    /// `lg_extract_rows(dst, src + c0, ci, co, rows)` - rows `[0, rows)` of channels
+    /// `[c0, c0 + co)` of a row-major `[rows][ci]` buffer, for splitting the window
+    /// attention's fused `[rows][3c]` qkv projection into q, k and v.
+    ///
+    /// This was `hat_token_range` until it was measured against the toolkit op and
+    /// removed - whose own doc names this exact caller ("used to split the ViT qkv
+    /// buffer into q/k/v"). The launch is part of the answer: the toolkit kernel wants
+    /// ONE BLOCK PER TOKEN, grid `(rows, 1, 1)` with a 256-thread block, and a
+    /// `(rows, 2, 1)`/128 launch measures 1.13-1.18x SLOWER over the same work, so the
+    /// grid below is not free to change. A/B: 1.000/1.000/0.999.
     pub fn token_range(&self, dst: &DevBuf, src: &DevBuf, co: usize, ci: usize, c0: usize,
                        rows: usize) -> Result<(), String> {
         let mut a = Args::new();
-        a.ptr(dst.ptr).ptr(src.ptr).i32(co as i32).i32(ci as i32).i32(c0 as i32)
+        a.ptr(dst.ptr).ptr(src.ptr + 4 * c0 as u64).i32(ci as i32).i32(co as i32)
             .i32(rows as i32);
-        self.flat("hat_token_range", rows * co, &mut a)
+        self.run("lg_extract_rows", (rows as u32, 1, 1), (256, 1, 1), 0, &mut a)
     }
 
     /// `lg_linear(x, w, bias, out, rows, c_in, c_out)` - `out = x W^T + bias` for a
@@ -466,16 +452,25 @@ impl Cuda {
         self.run("lg_linear", g, (16, 16, 1), 0, &mut a)
     }
 
-    /// `hat_plane_block(dst, src, bias, co, ci, c0, hw)` - copy channels
-    /// `[c0, c0+co)` of `src` to `dst`, adding that range of `bias` (null for none).
-    /// A fused projection writes one `[3c][hw]` plane and the reference's q, k, v and
-    /// `cat(k, v)` are exactly channel ranges of it.
+    /// `lg_channel_affine(src + c0*hw, dst, NULL, bias + c0, co, hw)` - copy channels
+    /// `[c0, c0+co)` of a `[ci][hw]` plane to a `[co][hw]` one, adding that range of
+    /// `bias` (null for none). A fused projection writes one `[3c][hw]` plane and the
+    /// reference's q, k, v and `cat(k, v)` are exactly channel ranges of it.
+    ///
+    /// This was `hat_plane_block` until it was measured against the toolkit op and
+    /// removed. The CHANNEL RANGE travels as a POINTER OFFSET because
+    /// `lg_channel_affine` takes its channel from the element index, so `in + c0*hw`
+    /// is channel `c0` of the source and `shift + c0` its bias - which is why `c0` is
+    /// still an argument here. `ci` is not used and is kept for the call sites'
+    /// benefit. Interleaved A/B with (co, c0) = (144, 0) and (288, 144): 1.000-1.007.
     pub fn plane_block(&self, dst: &DevBuf, src: &DevBuf, bias: Option<&DevBuf>,
                        co: usize, ci: usize, c0: usize, hw: usize) -> Result<(), String> {
+        let _ = ci;
         let mut a = Args::new();
-        a.ptr(dst.ptr).ptr(src.ptr).ptr(bias.map(|b| b.ptr).unwrap_or(0))
-            .i32(co as i32).i32(ci as i32).i32(c0 as i32).i32(hw as i32);
-        self.flat("hat_plane_block", co * hw, &mut a)
+        a.ptr(src.ptr + 4 * (c0 * hw) as u64).ptr(dst.ptr).ptr(0)
+            .ptr(bias.map(|b| b.ptr + 4 * c0 as u64).unwrap_or(0))
+            .i32(co as i32).i32(hw as i32);
+        self.flat("lg_channel_affine", co * hw, &mut a)
     }
 
     /// `hat_plane_edges(plane, c, hp, wp, pad)` - zero the `pad`-wide border rows and
@@ -503,17 +498,27 @@ impl Cuda {
         self.flat("hat_oca_label", nw * owin * owin, &mut a)
     }
 
-    /// `hat_pixel_shuffle(src, dst, c, h, w, r)` - `nn.PixelShuffle(r)`.
+    /// `lg_pixel_shuffle(src, dst, c, h, w, r)` - `nn.PixelShuffle(r)`.
     ///
     /// `r` is 2 for the head's `Upsample` octaves and 3 for its single scale-3
-    /// block; both come from `Weights::up_blocks()`. The toolkit has no shuffle in
-    /// this direction (`lg_pixel_unshuffle2` is the space-to-depth twin and
-    /// `lg_merge_2x2` is the ViT patch merge, the opposite permutation).
+    /// block; both come from `Weights::up_blocks()`, which is why the toolkit
+    /// kernel takes `r` as a runtime argument. This was a project kernel here
+    /// until it was promoted: it is depth-to-space, the toolkit had only the
+    /// opposite direction, and two other engines had written the same permutation
+    /// privately at r = 2.
+    ///
+    /// THE GRID IS PART OF THE CONTRACT and is not `flat`: the kernel puts the
+    /// channel in `blockIdx.z` with a 32x8 tile over the output plane, which is
+    /// where its speed comes from (measured 1.8-2.1x the flat form this engine
+    /// used to call). Launching it flat would be the block-shape mismatch
+    /// `docs/MAINTAINING.md` warns about - it would compute clean rows for the
+    /// first 1/256th of the plane.
     pub fn pixel_shuffle(&self, src: &DevBuf, dst: &DevBuf, c: usize, h: usize, w: usize,
                          r: usize) -> Result<(), String> {
         let mut a = Args::new();
         a.ptr(src.ptr).ptr(dst.ptr).i32(c as i32).i32(h as i32).i32(w as i32).i32(r as i32);
-        self.flat("hat_pixel_shuffle", c * h * r * w * r, &mut a)
+        let grid = (((w * r).div_ceil(32)) as u32, ((h * r).div_ceil(8)) as u32, c as u32);
+        self.run("lg_pixel_shuffle", grid, (32, 8, 1), 0, &mut a)
     }
 }
 
@@ -542,10 +547,10 @@ pub fn launched() -> &'static [&'static str] {
         "lg_channel_layer_norm", "lg_gelu_erf", "lg_sigmoid", "lg_relu", "lg_lrelu",
         "lg_add", "lg_add_scaled", "lg_copy", "lg_scale", "lg_channel_affine",
         "lg_channel_mean", "lg_channel_scale", "lg_window_gather", "lg_window_scatter",
+        "lg_extract_rows", "lg_pixel_shuffle",
         "hat_window_index", "hat_bias_gather", "hat_mask_build", "hat_unfold_kv",
         "hat_attention_d24", "hat_attention_d30",
-        "hat_plane_block", "hat_plane_edges", "hat_oca_label",
-        "hat_pixel_shuffle", "hat_token_range", "hat_plane_bias",
+        "hat_plane_edges", "hat_oca_label",
     ]
 }
 

@@ -12,8 +12,7 @@
 //! WHAT IS CHECKED, and how strictly:
 //!
 //! * `hat_window_index` vs `plan::window_index`, `hat_mask_build` vs
-//!   `plan::mask_label`, `hat_oca_label`, `hat_bias_gather`, `hat_plane_block`,
-//!   `hat_token_range`, `hat_pixel_shuffle`, `hat_plane_edges`, `hat_plane_bias` -
+//!   `plan::mask_label`, `hat_oca_label`, `hat_bias_gather`, `hat_plane_edges` -
 //!   INDEX AND DATA MOVEMENT, so these are compared with `==`, bit for bit and
 //!   integer for integer. These are the ones a silent mis-index breaks.
 //! * `hat_unfold_kv` - the same, since its only arithmetic is a select against zero.
@@ -25,6 +24,10 @@
 //!   bias, masked and unmasked) because the mask and the bias are passed as integers
 //!   and are the easiest arguments to shift by one.
 //!
+//! The kernels that MOVED INTO THE TOOLKIT are checked there instead: the toolkit's
+//! own `gpuinfo` selftest holds each twin against an independent reference, and this
+//! file's job is the kernels that are HAT's architecture rather than an op.
+//!
 //! The geometries are not random: a NON-SQUARE window grid (2 rows by 3 columns) is
 //! included in the index checks because an earlier version of `Plan::nw` built maps
 //! for a square grid only and every fixture in the repository was square, so nothing
@@ -34,10 +37,9 @@ use lightgpu::vm::{self, DevBuf};
 use crate::cuda::{upload_i32, Cuda};
 
 /// Members of the family that have a host twin, for the failure report.
-const CHECKED: [&str; 12] = [
+const CHECKED: [&str; 8] = [
     "hat_window_index", "hat_mask_build", "hat_oca_label", "hat_bias_gather",
-    "hat_unfold_kv", "hat_plane_block", "hat_token_range", "hat_pixel_shuffle",
-    "hat_plane_edges", "hat_plane_bias", "hat_attention_d24", "hat_attention_d30",
+    "hat_unfold_kv", "hat_plane_edges", "hat_attention_d24", "hat_attention_d30",
 ];
 
 /// The tolerance for the attention kernels, and ONLY for them: their host twin
@@ -250,70 +252,9 @@ fn check_unfold(cu: &Cuda, h: usize, w: usize, win: usize, owin: usize) -> Resul
     dot3_check(&format!("hat_unfold_kv v {h}x{w}"), &got_v, &want_v, 0.0)
 }
 
-/// `hat_plane_block` and `hat_token_range` against their definitions.
-fn check_ranges(cu: &Cuda) -> Result<(), String> {
-    let (ci, co, c0, hw) = (6usize, 4usize, 2usize, 9usize);
-    let src: Vec<f32> = (0..ci * hw).map(|i| i as f32).collect();
-    let bia: Vec<f32> = (0..ci).map(|i| i as f32 * 10.0).collect();
-    let (ds, db, do_) = (
-        DevBuf::from_host(&src)?,
-        DevBuf::from_host(&bia)?,
-        DevBuf::alloc(co * hw * 4)?,
-    );
-    cu.plane_block(&do_, &ds, Some(&db), co, ci, c0, hw)?;
-    let mut got = vec![0.0f32; co * hw];
-    do_.download(&mut got)?;
-    let mut want = vec![0.0f32; co * hw];
-    for ch in 0..co {
-        for p in 0..hw {
-            want[ch * hw + p] = src[(c0 + ch) * hw + p] + bia[c0 + ch];
-        }
-    }
-    dot3_check("hat_plane_block", &got, &want, 0.0)?;
-
-    let (rows, ci2, co2, c02) = (4usize, 7usize, 3usize, 2usize);
-    let ts: Vec<f32> = (0..rows * ci2).map(|i| i as f32 * 0.5).collect();
-    let (dts, dto) = (DevBuf::from_host(&ts)?, DevBuf::alloc(rows * co2 * 4)?);
-    cu.token_range(&dto, &dts, co2, ci2, c02, rows)?;
-    let mut got = vec![0.0f32; rows * co2];
-    dto.download(&mut got)?;
-    let mut want = vec![0.0f32; rows * co2];
-    for r in 0..rows {
-        for ch in 0..co2 {
-            want[r * co2 + ch] = ts[r * ci2 + c02 + ch];
-        }
-    }
-    dot3_check("hat_token_range", &got, &want, 0.0)
-}
-
-/// `hat_pixel_shuffle` against `nn.PixelShuffle(r)`, at BOTH factors the head uses.
-///
-/// The shapes are the same for r = 2 and r = 3, so only the permutation
-/// `sch = ch*r*r + (y%r)*r + (x%r)` distinguishes them - a kernel that hardcoded 2
-/// would still produce a full, plausible output plane at r = 3, which is exactly the
-/// class of bug this file exists for.
-fn check_pixel_shuffle(cu: &Cuda, r: usize) -> Result<(), String> {
-    let (c, h, w) = (2usize, 3usize, 4usize);
-    let src: Vec<f32> = (0..r * r * c * h * w).map(|i| i as f32).collect();
-    let dsd = DevBuf::from_host(&src)?;
-    let ddd = DevBuf::alloc(c * r * h * r * w * 4)?;
-    cu.pixel_shuffle(&dsd, &ddd, c, h, w, r)?;
-    let mut got = vec![0.0f32; c * r * h * r * w];
-    ddd.download(&mut got)?;
-    let mut want = vec![0.0f32; c * r * h * r * w];
-    for ch in 0..c {
-        for y in 0..r * h {
-            for x in 0..r * w {
-                let sch = ch * r * r + (y % r) * r + (x % r);
-                want[(ch * r * h + y) * r * w + x] = src[(sch * h + y / r) * w + x / r];
-            }
-        }
-    }
-    dot3_check(&format!("hat_pixel_shuffle r{r}"), &got, &want, 0.0)
-}
-
-/// `hat_plane_edges` and `hat_plane_bias` in place.
-fn check_edges_and_bias(cu: &Cuda) -> Result<(), String> {
+/// `hat_plane_edges` in place: the `pad`-wide border of every channel goes to zero
+/// and nothing else moves.
+fn check_edges(cu: &Cuda) -> Result<(), String> {
     let (c, hp, wp, pad) = (2usize, 6usize, 7usize, 2usize);
     let src: Vec<f32> = (0..c * hp * wp).map(|i| i as f32 + 1.0).collect();
     let d = DevBuf::from_host(&src)?;
@@ -330,20 +271,7 @@ fn check_edges_and_bias(cu: &Cuda) -> Result<(), String> {
             }
         }
     }
-    dot3_check("hat_plane_edges", &got, &want, 0.0)?;
-
-    let (c2, hw) = (3usize, 5usize);
-    let p: Vec<f32> = (0..c2 * hw).map(|i| i as f32).collect();
-    let b: Vec<f32> = (0..c2).map(|i| i as f32 * 100.0).collect();
-    let (dp, db) = (DevBuf::from_host(&p)?, DevBuf::from_host(&b)?);
-    cu.plane_bias(&dp, &db, c2, hw)?;
-    let mut got = vec![0.0f32; c2 * hw];
-    dp.download(&mut got)?;
-    let mut want = p.clone();
-    for i in 0..c2 * hw {
-        want[i] += b[i / hw];
-    }
-    dot3_check("hat_plane_bias", &got, &want, 0.0)
+    dot3_check("hat_plane_edges", &got, &want, 0.0)
 }
 
 /// `hat_oca_label` against its definition.
@@ -558,14 +486,8 @@ pub fn run() -> Result<(), String> {
 
     check_bias_gather(&cu)?;
     note("hat_bias_gather");
-    check_ranges(&cu)?;
-    note("hat_plane_block + hat_token_range");
-    for r in [2usize, 3] {
-        check_pixel_shuffle(&cu, r)?;
-        note(&format!("hat_pixel_shuffle r{r}"));
-    }
-    check_edges_and_bias(&cu)?;
-    note("hat_plane_edges + hat_plane_bias");
+    check_edges(&cu)?;
+    note("hat_plane_edges");
 
     // The attention at both head dims the family uses, square and non-square, with
     // and without a bias and a mask.

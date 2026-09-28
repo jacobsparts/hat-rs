@@ -2,8 +2,9 @@
 // does not (and should not) provide.
 //
 // The toolkit has the generic op set - 3x3 and 1x1 convolutions, matmuls, layer
-// norms, activations, the window gather/scatter pair - and this file has the four
-// things that are HAT's architecture rather than an op:
+// norms, activations, the window gather/scatter pair, and the depth-to-space the
+// reconstruction head's octaves need - and this file has the four things that are
+// HAT's architecture rather than an op:
 //
 //   * `hat_attention`, the windowed attention with a RELATIVE-POSITION BIAS and,
 //     for the odd blocks, the shifted-window MASK. The toolkit's `lg_attn_*` are
@@ -25,9 +26,17 @@
 // against `plan::window_index`, the host map the CPU backend indexes with. The
 // gather the graph uses is the toolkit's, which folds the same map in.
 //
-// EVERY KERNEL HERE IS CHECKED AGAINST ITS CPU TWIN by `--cuda-selftest`: a
-// kernel that merely produces a plausible image would otherwise pass `--verify`
-// on a lucky day.
+// EVERY KERNEL HERE IS CHECKED AGAINST A HOST TWIN by `--cuda-selftest`: a kernel
+// that merely produces a plausible image would otherwise pass `--verify` on a
+// lucky day.
+//
+// WHAT USED TO BE HERE AND IS NOT. Three kernels were restatements of toolkit ops
+// rather than architecture, and were measured against them before removal: the
+// pixel shuffle of the reconstruction head is now `lg_pixel_shuffle`, and
+// `hat_plane_block`/`hat_token_range`/`hat_plane_bias` are `lg_channel_affine`
+// (with the channel range as a pointer offset) and `lg_extract_rows`. Each A/B was
+// interleaved in one process and read a tie - 1.000-1.007 - and the shims that keep
+// the graph's call sites readable are in `src/cuda.rs` with the numbers.
 
 #include <math.h>
 
@@ -306,78 +315,7 @@ extern "C" __global__ void hat_attention_d30(
     hat_attn_impl<30>(q, kw, vw, bias, labels, out, nw, nq, nk, heads, scale, has_bias, masked);
 }
 
-// ---------------------------------------------------------------------------
-// A channel range of a plane
-// ---------------------------------------------------------------------------
 
-// `dst[ch][p] = src[c0 + ch][p] + bias[c0 + ch]` for ch in [0, co), p in [0, hw),
-// with `bias` allowed to be null (no bias). All three buffers are `[c][hw]` planes,
-// so this is the ONLY layout primitive the GPU backend needs: the fused qkv
-// projection writes one `[3c][hw]` plane, and q, k, v and `cat(k, v)` are channel
-// ranges of it whose biases are channel ranges of the same fused bias vector. That
-// is why the reference's `qkv = self.qkv(x)` needs no split kernel and no derived
-// weights: the split IS a range, and the bias IS that range's bias.
-//
-// (An earlier design divided the fused bias by two and relied on the unfold's zero
-// padding doubling it back. This is exact and needs no such reasoning.)
-//
-// grid = (ceil(co*hw / 256), 1, 1).
-extern "C" __global__ void hat_plane_block(
-    float *__restrict__ dst, const float *__restrict__ src, const float *__restrict__ bias,
-    int co, int ci, int c0, int hw)
-{
-    const long i = (long)blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= (long)co * hw) return;
-    const int ch = (int)(i / hw);
-    const long p = i % hw;
-    float v = src[(size_t)(c0 + ch) * hw + p];
-    if (bias) v += bias[c0 + ch];
-    dst[(size_t)ch * hw + p] = v;
-}
-
-// ---------------------------------------------------------------------------
-// The reconstruction head's pixel shuffle
-// ---------------------------------------------------------------------------
-
-// `nn.PixelShuffle(2)` on `[4c][h][w]` -> `[c][2h][2w]`: output pixel (2i+a, 2j+b)
-// of channel c is the input channel `4c + 2a + b` at (i, j). The toolkit has
-// `lg_merge_2x2`, but that is the ViT patch merge - four spatial neighbours
-// concatenated onto the channel axis, the OPPOSITE direction - so the head needs
-// its own.
-//
-// grid = (ceil(c*2h*2w / 256), 1, 1), one thread per OUTPUT element.
-// PIXEL SHUFFLE OF AN ARBITRARY FACTOR, `[r*r*c][h][w] -> [c][r*h][r*w]`.
-//
-// `r` is 2 for the reconstruction head's `Upsample` octave chain and 3 for the
-// reference's single scale-3 block, and it is a RUNTIME argument because both are
-// launched from the same place (`Weights::up_blocks()`). The toolkit has no shuffle
-// at all in this direction: `lg_pixel_unshuffle2` is the SPACE-TO-DEPTH twin and
-// `lg_merge_2x2` is the ViT patch merge, which concatenates four spatial neighbours
-// onto the channel axis - the opposite permutation, and using either here produces a
-// plausible image with its blocks transposed.
-//
-// THE SUBSAMPLING ORDER IS PyTorch's: input channel `c*r*r + i*r + j` goes to output
-// channel `c` at `(r*y + i, r*x + j)`, i.e. rows first, then columns. That is what
-// `nn.PixelShuffle` does with its `(c, r, r)` view, and it is the whole contract -
-// the shapes are identical either way.
-//
-// grid = (ceil(c*h*r*w*r / 256), 1, 1).
-extern "C" __global__ void hat_pixel_shuffle(
-    const float *__restrict__ src, float *__restrict__ dst, int c, int h, int w, int r)
-{
-    const int oh = h * r;
-    const int ow = w * r;
-    const long total = (long)c * oh * ow;
-    const long i = (long)blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= total) return;
-    const int x = (int)(i % ow);
-    const int y = (int)((i / ow) % oh);
-    const int ch = (int)(i / ((long)ow * oh));
-    const int iy = y / r;
-    const int ix = x / r;
-    const int sch = ch * r * r + (y % r) * r + (x % r);
-    dst[i] = src[((size_t)sch * h + iy) * w + ix];
-}
 
 // ---------------------------------------------------------------------------
 // The zero border the overlapping attention's unfold reads
@@ -450,43 +388,4 @@ extern "C" __global__ void hat_oca_label(
     labels[idx] = (y >= 0 && y < hp && x >= 0 && x < wp) ? 0 : 9;
 }
 
-// ---------------------------------------------------------------------------
-// A channel range of a TOKEN buffer
-// ---------------------------------------------------------------------------
 
-// `dst[r][ch] = src[r][c0 + ch]` for r in [0, rows), ch in [0, co): the
-// token-major twin of `hat_plane_block`, needed because the reference's
-// `qkv = self.qkv(x)` over the window TOKENS produces one `[rows][3c]` buffer and
-// q, k, v are channel ranges of it that the attention wants in separate buffers
-// (their channel strides are equal, but their contents are not, and a single
-// fused buffer would need three offsets threaded through the attention).
-//
-// grid = (ceil(rows*co / 256), 1, 1).
-extern "C" __global__ void hat_token_range(
-    float *__restrict__ dst, const float *__restrict__ src, int co, int ci, int c0, int rows)
-{
-    const long i = (long)blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= (long)rows * co) return;
-    const int ch = (int)(i % co);
-    const long r = i / co;
-    dst[i] = src[r * ci + c0 + ch];
-}
-
-// ---------------------------------------------------------------------------
-// The bias a GEMM does not have
-// ---------------------------------------------------------------------------
-
-// `plane[ch*hw + p] += bias[ch]`, in place. Every projection in this graph is a
-// `lg_f32_gemm_tiled`, which accumulates only products, so the bias of a checkpoint
-// Linear is added here afterwards. The alternative was to fold the bias into a
-// constant row of the weights, which changes the input the GEMM reads and therefore
-// what the *next* layer sees.
-//
-// grid = (ceil(c*hw / 256), 1, 1).
-extern "C" __global__ void hat_plane_bias(float *__restrict__ plane,
-                                         const float *__restrict__ bias, int c, int hw)
-{
-    const long i = (long)blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= (long)c * hw) return;
-    plane[i] += bias[i / hw];
-}
