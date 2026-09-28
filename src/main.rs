@@ -104,6 +104,41 @@ fn parse() -> Result<Args, String> {
     Ok(a)
 }
 
+/// The tile a GPU run uses when neither `--tile` nor `--mem` was given, picked
+/// from the card's own free VRAM.
+///
+/// WHY THE GUARD'S OWN ACCOUNTING. The tile this returns must be one the memory
+/// guard will ADMIT, or the run picks a size, refuses it, and the user is told
+/// to pass the very flag they left out on purpose. So this asks the same
+/// question the guard asks - `gpu_plan`'s need against `cuMemGetInfo`'s free -
+/// at a candidate tile, shrinking until the answer is yes. A separate budget
+/// derivation would be a second opinion that drifts from the guard's.
+///
+/// The search halves from the larger image side down to the window. A whole
+/// pass that fits returns a tile at least as large as the image, which the
+/// caller reports as "fits in free VRAM" and the tile loop runs as one tile.
+#[cfg(feature = "cuda")]
+fn gpu_auto_tile(wt: &Weights, h: usize, w: usize) -> Result<usize, String> {
+    let start = w.max(h).max(wt.window);
+    let mut t = start;
+    loop {
+        let plan = hat::memguard::gpu_plan(wt, t, t)?;
+        let fits = match (plan.need, plan.avail) {
+            (need, Some(avail)) => need <= avail,
+            // The driver would not say what is free: no basis to tile, so run the
+            // whole image and let the guard refuse if it must.
+            (_, None) => return Ok(start),
+        };
+        if fits {
+            return Ok(t);
+        }
+        if t <= wt.window {
+            return Err(hat::memguard::fmt_bytes(plan.avail.unwrap_or(0)) + " is free on the device, and one window does not fit it");
+        }
+        t = (t / 2).max(wt.window);
+    }
+}
+
 /// Resolves the device the run will actually use. Left unspecified, the GPU is
 /// used when the CUDA driver can be brought up and the CPU path when it cannot,
 /// so one binary covers a machine with no NVIDIA driver at all; `--device cpu`
@@ -192,23 +227,52 @@ fn run(args: &Args) -> Result<(), String> {
     let (w, h) = (img.w, img.h);
     println!("  input  {w}x{h} -> {}x{}", w * wt.scale, h * wt.scale);
     let t0 = std::time::Instant::now();
-    let planes = if args.tile.is_some() || args.mem.is_some() {
+    // The GPU run needs a memory plan even when neither flag was given: left
+    // out, the budget is the card's own free VRAM, so a whole-image pass runs
+    // when it fits what is actually free and the image tiles when it does not -
+    // rather than assuming a card size, or that nothing else holds VRAM. The
+    // CPU run keeps its no-plan default (the memguard's RAM check covers it).
+    #[cfg(feature = "cuda")]
+    let gpu_auto = device == "gpu" && args.tile.is_none() && args.mem.is_none();
+    #[cfg(not(feature = "cuda"))]
+    let gpu_auto = false;
+    let planes = if args.tile.is_some() || args.mem.is_some() || gpu_auto {
         let margin = default_margin(&wt);
         // `--mem` picks the tile from the backend's own accounting; an explicit
         // `--tile` is honoured but still capped by the budget when both are given,
         // because the budget is the promise and the tile is the preference.
+        let plan = hat::plan::Plan::new(h, w, wt.window, wt.embed);
+        let per_pixel = Cpu::footprint_floats(&wt, &plan) / (plan.tokens().max(1) as u64);
         let tile = match (args.tile, args.mem) {
             (Some(t), None) => t,
+            (None, None) => {
+                // The unspecified GPU case. The budget must be the SAME number the
+                // memguard's refusal is computed from - `gpu_plan`'s need, which is
+                // the device buffer set plus the weights plus the slack - or the
+                // tile this picks would be refused by the guard it is meant to
+                // satisfy. `gpu_auto_tile` below is exactly that: it shrinks the
+                // tile until `gpu_plan` says it fits free VRAM, so what runs is
+                // what the guard admits.
+                #[cfg(feature = "cuda")]
+                {
+                    let auto = gpu_auto_tile(&wt, h, w)?;
+                    if auto >= w.max(h) {
+                        println!("  whole-image pass fits in free VRAM");
+                    } else {
+                        println!("  free VRAM -> tile {auto}px (margin {margin})");
+                    }
+                    auto
+                }
+                #[cfg(not(feature = "cuda"))]
+                { unreachable!("gpu_auto is false without the cuda feature") }
+            }
             (t, Some(mib)) => {
                 let budget = (mib * 1024.0 * 1024.0) as u64;
-                let plan = hat::plan::Plan::new(h, w, wt.window, wt.embed);
-                let per_pixel = Cpu::footprint_floats(&wt, &plan) / (plan.tokens().max(1) as u64);
                 let auto = hat::tile::auto_tile(h, w, wt.window, budget, per_pixel, 0, margin)
                     .ok_or_else(|| format!("--mem {mib} MiB is too small even for one window (the index maps alone do not shrink)"))?;
                 println!("  --mem {mib} MiB -> tile {auto}px (margin {margin})");
                 match t { Some(t) => t.min(auto), None => auto }
             }
-            (None, None) => unreachable!("guarded by the outer if"),
         };
         let (out, info) = tile_forward(&wt, device, h, w, &img.data, tile, margin)?;
         println!("  tiled {} into {} tiles ({}px cores, {}px margin, largest {}x{})",
