@@ -3,9 +3,8 @@
 //!
 //! WHY THIS EXISTS. `--verify` compares a backend's whole image with the reference's,
 //! which catches a wrong *graph* but is a weak instrument for a wrong *kernel*: the
-//! four project kernels that do not exist in the toolkit (`hat_bias_gather`,
-//! `hat_mask_build`, `hat_unfold_kv`, the attention) all take a long argument list of
-//! shapes, and the argument order is the one thing the Rust compiler cannot check. A
+//! project kernels in `cuda/hat.cu` take a long argument list of shapes, and the
+//! argument order is the one thing the Rust compiler cannot check. A
 //! mis-ordered or mis-scaled argument produces a plausible image. Every kernel here is
 //! therefore run against a host twin - the same arithmetic written twice, once in CUDA
 //! and once in Rust - and the two outputs are compared elementwise.

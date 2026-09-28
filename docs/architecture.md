@@ -5,7 +5,10 @@ forward: x = (x - mean) * img_range            mean=(0.4488,0.4371,0.4040) for 3
          f = forward_features(x)
          x = conv_after_body(f) + x            embed -> embed 3x3
          x = conv_before_upsample(x)           {Conv2d(embed,64,3,1,1), LeakyReLU(0.01)}
-         x = conv_last(upsample(x))            {Conv2d(64,256,3,1,1), PixelShuffle(2)} * log2(scale); Conv2d(64,3,3,1,1)
+         x = conv_last(upsample(x))            Upsample: a power of two is Conv2d(64,256,3,1,1)
+                                                + PixelShuffle(2) per octave; scale 3 is ONE
+                                                Conv2d(64,576,3,1,1) + PixelShuffle(3).
+                                                Then Conv2d(64,3,3,1,1)
          out = x / img_range + mean
 forward_features: t = patch_embed(x)          flatten(2).transpose(1,2) then LayerNorm(embed)   [patch_embed.norm exists]
          for layer in layers: t = RHAG(t, (h,w), params)

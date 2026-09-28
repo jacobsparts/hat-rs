@@ -304,8 +304,8 @@ impl Weights {
         vec![(2, 4 * feat); n]
     }
 
-    /// A tensor's shape, for the code that has to budget device memory rather than
-    /// read values (`gpu::uploaded_bytes`). Every name asked about here was
+    /// A tensor's shape, for the code that has to budget memory rather than read
+    /// values (`memguard`). Every name asked about here was
     /// validated at load, so a miss here is a programming error.
     #[inline]
     pub fn shape(&self, name: &str) -> &[usize] {
