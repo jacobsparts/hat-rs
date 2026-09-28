@@ -29,133 +29,6 @@ pub struct Cuda {
     pub project: Module,
 }
 
-/// Per-KERNEL device timing, for localising a cost the way `dump` localises an error.
-///
-/// `HAT_RS_TIME=1` makes every launch record a pair of CUDA events around itself and
-/// `report` print the device milliseconds accumulated per kernel name. It is the GPU
-/// twin of `cpu::prof` and exists for the same reason: the only number the engine
-/// otherwise has is the wall clock of a whole forward, which says nothing about
-/// WHICH kernel to attack - and on this workload one or two kernels dominate.
-///
-/// THE EVENTS ARE RECORDED, NOT SYNCHRONISED. `cuEventRecord` only enqueues, so the
-/// launches stay asynchronous and the pipeline is not serialised by the measurement;
-/// one `cuCtxSynchronize` at report time resolves the whole queue at once. What is
-/// attributed to a kernel is its DEVICE time, which excludes the host-side launch
-/// cost - the right thing to optimize against, and the reason a profile can be
-/// dominated by a kernel while the wall clock is dominated by launches (in which
-/// case the report shows a total well below the measured forward, and the gap is the
-/// answer rather than a defect in the measurement).
-mod prof {
-    use lightgpu::vm::Event;
-    use std::cell::RefCell;
-    use std::sync::OnceLock;
-
-    fn enabled() -> bool {
-        static E: OnceLock<bool> = OnceLock::new();
-        *E.get_or_init(|| std::env::var("HAT_RS_TIME").map(|v| !v.is_empty()).unwrap_or(false))
-    }
-
-    /// One bracketed launch, holding its two events so both are destroyed with it.
-    struct Rec {
-        name: String,
-        start: Event,
-        end: Event,
-    }
-
-    /// THREAD LOCAL, NOT GLOBAL: a forward drives one stream from one thread, and a
-    /// `CUevent` is not `Send` (it is a raw handle), so a process-wide list would not
-    /// compile - and would not be the right model either, since two concurrent
-    /// forwards would interleave their brackets into one meaningless total.
-    thread_local! {
-        static RECS: RefCell<Vec<Rec>> = const { RefCell::new(Vec::new()) };
-    }
-
-    /// Start bracketing a launch. `None` when the report is off, which is what keeps
-    /// the instrumentation cheap in a normal build: one `OnceLock` lookup per launch,
-    /// no event created and no allocation.
-    pub fn mark() -> Option<(Event, Event)> {
-        if !enabled() {
-            return None;
-        }
-        let start = Event::new().ok()?;
-        let end = Event::new().ok()?;
-        start.record().ok()?;
-        Some((start, end))
-    }
-
-    /// Finish bracketing: record the end event and file the pair under the name.
-    pub fn done(name: &str, mark: Option<(Event, Event)>) {
-        let (start, end) = match mark {
-            Some(m) => m,
-            None => return,
-        };
-        if end.record().is_err() {
-            return;
-        }
-        RECS.with(|r| {
-            if let Ok(mut v) = r.try_borrow_mut() {
-                v.push(Rec { name: name.to_string(), start, end });
-            }
-        });
-    }
-
-    /// The number of launches bracketed since the last report, for the host-side
-    /// question: a forward whose DEVICE time is well below its wall clock is either
-    /// launch-bound or waiting on something that is not a kernel.
-    pub fn counts_total() -> usize {
-        let mut n = 0usize;
-        RECS.with(|r| {
-            if let Ok(v) = r.try_borrow() {
-                n = v.len();
-            }
-        });
-        n
-    }
-
-    /// Synchronise, sum by name, and print descending. Called at the end of every
-    /// forward, so a tiled run reports one table per tile.
-    pub fn report() {
-        if !enabled() {
-            return;
-        }
-        // The queue is resolved BEFORE the events are read, and before they are
-        // dropped, so the elapsed times are real and not a queue of zeros.
-        let n = RECS.with(|r| r.borrow().len());
-        if n == 0 {
-            return;
-        }
-        if lightgpu::vm::sync().is_err() {
-            return;
-        }
-        // Counts as well as times: a kernel launched once and a kernel launched four
-        // hundred times need different fixes even when their total time is the same.
-        let mut by: Vec<(String, f64, usize)> = Vec::new();
-        RECS.with(|r| {
-            if let Ok(v) = r.try_borrow() {
-                for rec in v.iter() {
-                    let ms = rec.start.elapsed_ms(&rec.end).unwrap_or(0.0) as f64;
-                    match by.iter_mut().find(|(n, _, _)| *n == rec.name) {
-                        Some((_, acc, c)) => { *acc += ms; *c += 1; }
-                        None => by.push((rec.name.clone(), ms, 1)),
-                    }
-                }
-            }
-        });
-        RECS.with(|r| {
-            if let Ok(mut v) = r.try_borrow_mut() {
-                v.clear();
-            }
-        });
-        by.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
-        let total: f64 = by.iter().map(|(_, v, _)| *v).sum();
-        let n: usize = by.iter().map(|(_, _, c)| *c).sum();
-        eprintln!("  gpu profile, {total:.1} ms of device time in {n} launches:");
-        for (name, t, c) in by {
-            eprintln!("    {name:<22} {t:>9.2} ms {c:>6}x  {:>5.1}%",
-                      100.0 * t / total.max(1e-9));
-        }
-    }
-}
 
 impl Cuda {
     pub fn new() -> Result<Cuda, String> {
@@ -180,9 +53,9 @@ impl Cuda {
 
     pub fn run(&self, name: &str, g: (u32, u32, u32), b: (u32, u32, u32), shared: u32,
                args: &mut Args) -> Result<(), String> {
-        let mark = prof::mark();
+
         let r = args.launch(self.module_of(name)?, name, Launch::new(g, b).shared(shared));
-        prof::done(name, mark);
+
         r
     }
 
@@ -657,11 +530,6 @@ pub fn upload_i32(values: &[i32]) -> Result<DevBuf, String> {
     Ok(buf)
 }
 
-/// Print the per-kernel device-time profile accumulated since the last report.
-/// A no-op unless `HAT_RS_TIME` is set, so callers do not need to ask.
-pub fn report() {
-    prof::report();
-}
 
 /// Every kernel name this engine launches, checked against the loaded modules
 /// before the first allocation so a missing kernel is one clear error rather than a

@@ -32,7 +32,7 @@
 //! caught it.
 use lightgpu::vm::{self, DevBuf};
 
-use crate::cuda::{grid, upload_i32, Cuda};
+use crate::cuda::{upload_i32, Cuda};
 
 /// Members of the family that have a host twin, for the failure report.
 const CHECKED: [&str; 12] = [
@@ -473,9 +473,9 @@ fn check_attention(
 /// whole graph - the point is to catch a TRANSFORM or INDEXING error (which is 1e-1),
 /// not the last bit.
 fn check_winograd(cu: &Cuda, ci: usize, co: usize, h: usize, w: usize) -> Result<f32, String> {
-    let (hw, n) = (h * w, h * w);
+    let hw = h * w;
     let wave = |n: usize, s: usize| -> Vec<f32> {
-        (0..n).map(|i| ((((i * s) % 211) as f32) / 211.0 - 0.5)).collect()
+        (0..n).map(|i| (((i * s) % 211) as f32) / 211.0 - 0.5).collect()
     };
     let inp = wave(ci * hw, 3);
     let wts = wave(co * ci * 9, 5);

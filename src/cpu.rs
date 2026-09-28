@@ -35,12 +35,9 @@
 //!
 //! and `residual_group` is `depth` HABs followed by the stage's OCAB, exactly as
 //! `AttenBlocks.forward` does it.
-use std::sync::OnceLock;
-
 use rayon::prelude::*;
 
 use crate::backend::{finish, Backend, Pre};
-use crate::dump;
 use crate::plan::{unfold_index, window_index, Plan};
 use crate::weights::Weights;
 
@@ -306,12 +303,8 @@ impl<'a> Cpu<'a> {
 /// OUTERMOST, so the three passes are the only order that matches it.
 fn conv3x3(inp: &[f32], out: &mut [f32], w: &[f32], bias: &[f32], ci: usize, co: usize,
            h: usize, wd: usize, relu: bool) {
-    let _t = prof::t(prof::CONV);
-    // Keyed with `ci * 9` so the table reports the conv's REAL reduction length: a
-    // "144->144" convolution is a `1296 -> 144` matmul per pixel, and reading it next
-    // to the `linear` table is what shows which of the two operators is behind.
-    let _s = prof::ts(ci * 9, co, h * wd);
     let hw = h * wd;
+    debug_assert_eq!(out.len(), co * hw, "see the contract above");
     // ONE flat parallel loop over `co * hw` output elements, not a loop over channels
     // with a second parallel loop inside it. The nested form gave rayon `co` outer
     // tasks of `hw` inner ones each, and at 48x48 with 144 channels that is 144 tiny
@@ -440,7 +433,7 @@ const BLK: usize = 8;
 /// A matmul over the channel axis at every pixel, so the reduction is over `c_in`
 /// and the order is c ascending.
 fn conv1x1(inp: &[f32], out: &mut [f32], w: &[f32], bias: &[f32], ci: usize, co: usize, hw: usize) {
-    let _t = prof::t(prof::CONV1X1);
+    debug_assert_eq!(out.len(), co * hw);
     out.par_chunks_mut(hw).enumerate().for_each(|(o, dst)| {
         let b = bias[o];
         let k = &w[o * ci..(o + 1) * ci];
@@ -461,8 +454,7 @@ fn conv1x1(inp: &[f32], out: &mut [f32], w: &[f32], bias: &[f32], ci: usize, co:
 /// and a row is 144 multiply-adds which is worth a task. `W` is `[c_out][c_in]` -
 /// the checkpoint's layout - so the reference's `x @ W.t()` is `dot(row, W[o])`.
 fn linear(x: &[f32], out: &mut [f32], w: &[f32], bias: &[f32], ci: usize, co: usize, rows: usize) {
-    let _t = prof::t(prof::MATMUL);
-    let _s = prof::ts(ci, co, rows);
+    debug_assert_eq!(out.len(), rows * co);
     // AN 8x8 REGISTER TILE OVER (ROWS, OUTPUT CHANNELS) WHOSE INNER BOUNDS ARE
     // COMPILE-TIME CONSTANTS, plus a scalar edge path for the leftover rows and
     // columns. BOTH PARTS OF THAT MATTER, and the second one is what the first
@@ -569,7 +561,6 @@ fn linear(x: &[f32], out: &mut [f32], w: &[f32], bias: &[f32], ci: usize, co: us
 /// float32 on the CPU; `var` is BIASED (divided by `c`, not `c-1`), and `eps` is
 /// 1e-5, not a tunable.
 fn layer_norm(x: &mut [f32], weight: &[f32], bias: &[f32], c: usize, rows: usize, eps: f32) {
-    let _t = prof::t(prof::NORM);
     x.par_chunks_mut(c).enumerate().take(rows).for_each(|(_, row)| {
         let mut mean = 0.0f32;
         for v in row.iter() {
@@ -617,7 +608,6 @@ fn erf(x: f32) -> f32 {
 /// and divides once, so the sum here is a plain ascending loop over the plane (and
 /// then over the batch, which is always 1).
 fn channel_mean(x: &[f32], out: &mut [f32], c: usize, hw: usize) {
-    let _t = prof::t(prof::NORM);
     out.par_iter_mut().enumerate().take(c).for_each(|(ci, o)| {
         let mut acc = 0.0f32;
         let p = &x[ci * hw..(ci + 1) * hw];
@@ -640,7 +630,6 @@ fn channel_scale(x: &mut [f32], gate: &[f32], c: usize, hw: usize) {
 
 /// `dst += src * scale`, the block's residual form.
 fn add_scaled(dst: &mut [f32], src: &[f32], scale: f32) {
-    let _t = prof::t(prof::OTHER);
     dst.par_iter_mut().zip(src.par_iter()).for_each(|(d, s)| *d += *s * scale);
 }
 
@@ -652,7 +641,6 @@ fn add_scaled(dst: &mut [f32], src: &[f32], scale: f32) {
 /// is ever made. The reference's `permute(0, 1, 3, 2, 4, 5).contiguous().view(-1, n, c)`
 /// puts the CHANNEL axis innermost, which is what every matmul downstream wants.
 fn gather_windows(plane: &[f32], idx: &[u32], out: &mut [f32], c: usize, win: usize, hw: usize) {
-    let _t = prof::t(prof::WINDOW);
     let wq = win * win;
     out.par_chunks_mut(wq * c).enumerate().for_each(|(wi, dst)| {
         let map = &idx[wi * wq..(wi + 1) * wq];
@@ -670,37 +658,18 @@ fn gather_windows(plane: &[f32], idx: &[u32], out: &mut [f32], c: usize, win: us
 /// other way, and each destination element written exactly once because a window
 /// partition is a bijection on the plane.
 fn scatter_windows(tok: &[f32], idx: &[u32], plane: &mut [f32], c: usize, win: usize, hw: usize) {
-    let _t = prof::t(prof::WINDOW);
     let wq = win * win;
     let nw = idx.len() / wq;
-    // Parallel over WINDOWS, each into its own scratch, then one serial pass to the
-    // plane. There is no unsafe write into a shared buffer: the raw-pointer version
-    // this replaces needed an `unsafe impl Send` on a pointer wrapper, and the cost
-    // of the extra pass is one more read and write of the plane per call - which for
-    // the shapes here (hp*wp*c floats) is small against the attention it follows.
-    //
-    // Every plane element IS covered exactly once, because a window partition
-    // partitions the plane (the padded plane's side is a multiple of the window), so
-    // the serial pass writes each element once and leaves none untouched. A window
-    // index map with repeats would break that, which is why `window_index` is tested
-    // for bijectivity.
-    let mut staged = vec![0.0f32; nw * wq * c];
-    staged.par_chunks_mut(wq * c).enumerate().for_each(|(wi, dst)| {
-        let map = &idx[wi * wq..(wi + 1) * wq];
-        let src = &tok[wi * wq * c..(wi + 1) * wq * c];
-        for (t, d) in map.iter().enumerate() {
-            let d = *d as usize;
-            for ch in 0..c {
-                dst[t * c + ch] = src[t * c + ch];
-                let _ = d;
-            }
-        }
-    });
-    // The staged layout is window-major, so the serial pass walks the maps again
-    // rather than assuming a layout.
+    // NO SAFETY ARGUMENT IS NEEDED AND NO SCRATCH IS USED. Writing the plane through
+    // the map is correct because a window partition is a BIJECTION on the padded
+    // plane: every destination element is written exactly once and none is left
+    // untouched, which `window_index`'s bijectivity test pins. An earlier form handed
+    // a raw pointer across the rayon boundary wrapped in `unsafe impl Send/Sync`,
+    // justified by window disjointness; this form needs no such argument because it
+    // never aliases - one serial pass over the maps, reading `tok`, writing `plane`.
     for wi in 0..nw {
         let map = &idx[wi * wq..(wi + 1) * wq];
-        let src = &staged[wi * wq * c..(wi + 1) * wq * c];
+        let src = &tok[wi * wq * c..(wi + 1) * wq * c];
         for (t, d) in map.iter().enumerate() {
             let d = *d as usize;
             for ch in 0..c {
@@ -709,13 +678,6 @@ fn scatter_windows(tok: &[f32], idx: &[u32], plane: &mut [f32], c: usize, win: u
         }
     }
 }
-
-// The scatter used to hand a raw pointer across the rayon boundary and wrapped it
-// here with `unsafe impl Send/Sync`, justified by window disjointness. The
-// scatter's replacement stages each window into its own slice and copies once,
-// which removes the unsafe entirely - and the wrapper with it, so that no kernel in
-// this file relies on a written-down disjointness argument. The safety property is
-// now structural: `par_chunks_mut` cannot alias.
 
 /// The OCAB's key/value gather: the `nn.Unfold(kernel=owin, stride=win, padding=opad)`
 /// of a `[2c][hp][wp]` plane into `[nw][wk][c]` keys and values.
@@ -735,7 +697,6 @@ fn scatter_windows(tok: &[f32], idx: &[u32], plane: &mut [f32], c: usize, win: u
 ///   the softmax is over the same 169 terms with the same zero entries.
 fn unfold_kv(plane: &[f32], idx: &[u32], keep: &[u8], k: &mut [f32], v: &mut [f32],
              c: usize, wk: usize, hw: usize) {
-    let _t = prof::t(prof::WINDOW);
     let nw = idx.len() / wk;
     k.par_chunks_mut(wk * c).zip(v.par_chunks_mut(wk * c)).enumerate().take(nw)
         .for_each(|(wi, (kd, vd))| {
@@ -811,7 +772,6 @@ fn split_qkv(qkv: &[f32], q: &mut [f32], k: &mut [f32], v: &mut [f32], c: usize,
 fn window_attention(q: &[f32], k: &[f32], v: &[f32], bias: Option<&[f32]>, bias_idx: Option<&[u32]>,
                     bias_tab: Option<&[f32]>, mask: &[f32], out: &mut [f32],
                     nw: usize, nq: usize, heads: usize, d: usize, scale: f32, has_mask: bool) {
-    let _t = prof::t(prof::ATTN);
     let c = heads * d;
     // One output row per (window, query); serial over the heads inside it.
     out.par_chunks_mut(c).enumerate().take(nw * nq).for_each_init(
@@ -892,10 +852,7 @@ fn window_attention(q: &[f32], k: &[f32], v: &[f32], bias: Option<&[f32]>, bias_
 fn overlap_attention(q: &[f32], k: &[f32], v: &[f32], bias_idx: &[u32], bias_tab: &[f32],
                      out: &mut [f32], nw: usize, nq: usize, nk: usize, heads: usize,
                      d: usize, scale: f32) {
-    let _t = prof::t(prof::ATTN);
     let c = heads * d;
-    let npoints = bias_tab.len() / heads;
-    let _ = npoints;
     out.par_chunks_mut(nq * c).enumerate().take(nw).for_each(|(wi, od)| {
         let qw = &q[wi * nq * c..(wi + 1) * nq * c];
         let kw = &k[wi * nk * c..(wi + 1) * nk * c];
@@ -1025,7 +982,6 @@ fn cab(a: &mut Acts, wt: &Weights, p: &str, c: usize, h: usize, w: usize) {
 /// the caller owns the residual.
 fn ocab(a: &mut Acts, wt: &Weights, plan: &Plan, stage: usize) {
     let c = wt.embed;
-    let (hp, wp) = (plan.hp, plan.wp);
     let hw = plan.tokens();
     let (nw, wq, wk) = (plan.nw(), plan.wq(), plan.wk());
     let p = format!("layers.{stage}.residual_group.overlap_attn");
@@ -1037,8 +993,7 @@ fn ocab(a: &mut Acts, wt: &Weights, plan: &Plan, stage: usize) {
     // layout because the unfold works on channels.
     linear(&a.tok, &mut a.qkv, wt.t(&format!("{p}.qkv.weight")), wt.t(&format!("{p}.qkv.bias")),
            c, 3 * c, hw);
-    dump::write(&format!("{}_qkv", dump::stem(&p)), &[hw, 3 * c], &a.qkv[..hw * 3 * c]);
-    dump::tokens(&format!("{}_norm1", dump::stem(&p)), &a.tok, c, hp, wp);
+
     // q: the first c channels, windowed directly (no unfold).
     // CHANNEL-MAJOR `[c][hw]`, for the same reason as the kv plane below:
     // `gather_windows` indexes a plane as `[ch][hw]`, so a token-major buffer here
@@ -1078,164 +1033,28 @@ fn ocab(a: &mut Acts, wt: &Weights, plan: &Plan, stage: usize) {
     }
     // NOTE the arguments: `c` is the HALF width of the 2c plane and `hw` its pixel
     // count, which is what lets `unfold_kv` find the values at `c * hw`.
-    dump::write(&format!("{}_kvplane", dump::stem(&p)), &[2 * c, hp, wp], &kv_plane[..2 * c * hw]);
-    dump::write(&format!("{}_qwin", dump::stem(&p)), &[nw, wq, c], &a.oq[..nw * wq * c]);
+
     unfold_kv(&kv_plane, &a.k_idx, &a.k_keep, &mut a.okv, &mut a.ovv, c, wk, hw);
-    dump::write(&format!("{}_kwin", dump::stem(&p)), &[nw, wk, c], &a.okv[..nw * wk * c]);
-    dump::write(&format!("{}_vwin", dump::stem(&p)), &[nw, wk, c], &a.ovv[..nw * wk * c]);
 
     let q_rows = nw * wq;
-    let k_rows = nw * wk;
     // No second projection: the keys and values ARE the projected plane's channels.
     overlap_attention(&a.oq, &a.okv, &a.ovv, &a.rpi_oca,
                       wt.t(&format!("{p}.relative_position_bias_table")),
                       &mut a.oout, nw, wq, wk, wt.heads, wt.head_dim, scale);
     let mut proj = std::mem::take(&mut a.proj);
     proj.resize(q_rows * c, 0.0);
-    dump::write(&format!("{}_outwin", dump::stem(&p)), &[nw, wq, c], &a.oout[..nw * wq * c]);
+
     linear(&a.oout, &mut proj, wt.t(&format!("{p}.proj.weight")), wt.t(&format!("{p}.proj.bias")),
            c, c, q_rows);
-    dump::write(&format!("{}_projwin", dump::stem(&p)), &[nw, wq, c], &proj[..nw * wq * c]);
+
     // `window_reverse` onto whatever plane the caller wants the result in; here
     // `plane` holds the block's input (the caller's residual base).
     scatter_windows(&proj, &a.wi_plain, &mut a.plane2, c, plan.win, hw);
-    dump::plane(&format!("{}_proj", dump::stem(&p)), &a.plane2, c, hp, wp);
+
     a.qplane = q_plane; a.kvplane = kv_plane; a.proj = proj;
-    let _ = (q_rows, k_rows, hp, wp);
-}
-
-/// Tokens <-> plane. The two layouts are the same data with the channel axis moved,
-/// which is what the reference's `permute`/`contiguous` pairs do.
-/// Per-operation timing, for localising a COST the way `dump` localises an error.
-///
-/// `HAT_RS_TIME=1` makes the forward accumulate nanoseconds in eight categories and
-/// print them at the end. The overhead is one `Instant::now` per call of a large
-/// kernel - tens of nanoseconds against milliseconds of work - so it is left in
-/// unconditionally and only the PRINTING is conditional.
-///
-/// The categories are the operators, not the graph, because that is what a change
-/// can act on: `CONV` and `MATMUL` are the two things worth optimising and the rest
-/// is what bounds how much a win there is worth.
-mod prof {
-    use std::sync::atomic::{AtomicU64, Ordering};
-    use std::sync::OnceLock;
-    use std::time::Instant;
-
-    pub const CONV: usize = 0;
-    pub const MATMUL: usize = 1;
-    pub const NORM: usize = 2;
-    pub const ATTN: usize = 3;
-    pub const WINDOW: usize = 4;
-    pub const RELAYOUT: usize = 5;
-    pub const HEAD: usize = 6;
-    pub const OTHER: usize = 7;
-    /// The CAB's two 1x1 convolutions, kept SEPARATE from `MATMUL` because they are
-    /// the same operator shape with a completely different access pattern (a plane
-    /// with an `hw` stride, not a token matrix) and a change that speeds one up need
-    /// not touch the other.
-    pub const CONV1X1: usize = 8;
-
-    static NANOS: [AtomicU64; 9] = [
-        AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0),
-        AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0),
-        AtomicU64::new(0),
-    ];
-    const NAMES: [&str; 9] = ["conv3x3", "matmul", "layernorm", "attention", "windows",
-                              "relayout", "head", "other", "conv1x1"];
-
-    fn enabled() -> bool {
-        static E: OnceLock<bool> = OnceLock::new();
-        *E.get_or_init(|| std::env::var("HAT_RS_TIME").map(|v| !v.is_empty()).unwrap_or(false))
-    }
-
-    /// A scoped timer. `Instant::now` is called even when the report is off, which is
-    /// deliberate: the cost is negligible next to the kernels being timed and it
-    /// keeps the instrumented and the measured build the same code.
-    pub struct T(usize, Instant);
-
-    pub fn t(cat: usize) -> T {
-        T(cat, Instant::now())
-    }
-
-    /// Per-shape matmul accounting, for the question "which of these twelve `linear`
-    /// call sites costs the time?". A shared `Mutex` because `linear` runs on rayon
-    /// workers; it is only touched when `HAT_RS_TIME` is set, and one uncontended lock
-    /// per matmul is far below the matmul's own cost.
-    fn shapes() -> &'static std::sync::Mutex<std::collections::HashMap<(usize, usize, usize), (u64, u64)>> {
-        static S: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<(usize, usize, usize), (u64, u64)>>> =
-            std::sync::OnceLock::new();
-        S.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
-    }
-
-    pub struct TS((usize, usize, usize), Instant);
-
-    pub fn ts(ci: usize, co: usize, rows: usize) -> TS {
-        TS((ci, co, rows), Instant::now())
-    }
-
-    impl Drop for TS {
-        fn drop(&mut self) {
-            if !enabled() {
-                return;
-            }
-            let ns = self.1.elapsed().as_nanos() as u64;
-            if let Ok(mut m) = shapes().lock() {
-                let e = m.entry(self.0).or_insert((0, 0));
-                e.0 += ns;
-                e.1 += 1;
-            }
-        }
-    }
-
-    /// Print the per-shape matmul table, descending by total time.
-    pub fn report_shapes() {
-        if !enabled() {
-            return;
-        }
-        let m = match shapes().lock() {
-            Ok(m) => m,
-            Err(_) => return,
-        };
-        let mut v: Vec<((usize, usize, usize), (u64, u64))> = m.iter().map(|(k, x)| (*k, *x)).collect();
-        v.sort_by(|a, b| b.1 .0.cmp(&a.1 .0));
-        let total: f64 = v.iter().map(|(_, (ns, _))| *ns as f64).sum::<f64>() / 1e6;
-        eprintln!("  linear by shape, {total:.1} ms total:");
-        for ((ci, co, rows), (ns, n)) in v.iter().take(14) {
-            let gflop = 2.0 * (*ci * *co * *rows) as f64 * (*n as f64) / 1e9;
-            eprintln!("    {ci:>4}->{co:<4} rows {rows:<6} {n:>6} calls {:>9.1} ms  {:>6.1} GFLOP  {:>5.1} GFLOPS",
-                      *ns as f64 / 1e6, gflop, gflop / (*ns as f64 / 1e9).max(1e-9));
-        }
-    }
-
-    impl Drop for T {
-        fn drop(&mut self) {
-            NANOS[self.0].fetch_add(self.1.elapsed().as_nanos() as u64, Ordering::Relaxed);
-        }
-    }
-
-    /// Print the totals in descending order, as a share of the sum. Called at the end
-    /// of each forward, so a tiled run reports one table per tile - which is itself
-    /// the useful thing to see there.
-    pub fn report() {
-        if !enabled() {
-            return;
-        }
-        let ms = |i: usize| NANOS[i].load(Ordering::Relaxed) as f64 / 1e6;
-        let total: f64 = (0..9).map(ms).sum();
-        let mut rows: Vec<(f64, &str)> = (0..9).map(|i| (ms(i), NAMES[i])).collect();
-        rows.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap());
-        eprintln!("  cpu profile, {total:.1} ms of operator time:");
-        for (v, n) in rows {
-            if v > 0.0 {
-                eprintln!("    {n:<10} {v:>9.1} ms  {:>5.1}%", 100.0 * v / total.max(1e-9));
-            }
-        }
-        report_shapes();
-    }
 }
 
 fn to_plane(tok: &[f32], plane: &mut [f32], c: usize, hw: usize) {
-    let _t = prof::t(prof::RELAYOUT);
     plane.par_chunks_mut(hw).enumerate().take(c).for_each(|(ch, dst)| {
         for i in 0..hw {
             dst[i] = tok[i * c + ch];
@@ -1244,7 +1063,6 @@ fn to_plane(tok: &[f32], plane: &mut [f32], c: usize, hw: usize) {
 }
 
 fn to_tokens(plane: &[f32], tok: &mut [f32], c: usize, hw: usize) {
-    let _t = prof::t(prof::RELAYOUT);
     tok.par_chunks_mut(c).enumerate().take(hw).for_each(|(i, dst)| {
         for ch in 0..c {
             dst[ch] = plane[ch * hw + i];
@@ -1288,14 +1106,13 @@ fn hab(a: &mut Acts, wt: &Weights, plan: &Plan, stage: usize, block: usize) {
     to_tokens(&a.plane, &mut a.tok, c, hw);
     layer_norm(&mut a.tok, wt.t(&format!("{p}.norm1.weight")),
                wt.t(&format!("{p}.norm1.bias")), c, hw, 1e-5);
-    dump::tokens(&format!("{}_norm1", dump::stem(&p)), &a.tok, c, h, w);
 
     // The CAB is a 3x3-conv block, so it runs on the plane layout: `plane` is free
     // now that the shortcut is in plane2, and the normed tokens are copied into it.
     to_plane(&a.tok, &mut a.mid_plane, c, hw);
     std::mem::swap(&mut a.plane, &mut a.mid_plane);
     cab(a, wt, &format!("{p}.conv_block"), c, h, w);
-    dump::plane(&format!("{}_conv_block", dump::stem(&p)), &a.plane, c, h, w);
+
     a.mid_plane.copy_from_slice(&a.plane);         // conv_x
     a.plane.copy_from_slice(&a.plane2);            // back to the shortcut
 
@@ -1304,8 +1121,6 @@ fn hab(a: &mut Acts, wt: &Weights, plan: &Plan, stage: usize, block: usize) {
     // plane first - the same `to_plane` result the CAB used, recomputed because the
     // CAB may have overwritten `mid_plane`. `qplane` is free until the OCAB.
     to_plane(&a.tok, &mut a.qplane, c, hw);
-    // The MASK ITSELF, once, so the GPU's label-derived form can be compared against
-    // this reference transcription of `calculate_mask` elementwise.
     let idx: &[u32] = if shifted { &a.wi_shift } else { &a.wi_plain };
     gather_windows(&a.qplane, idx, &mut a.win, c, plan.win, hw);
     linear(&a.win, &mut a.qkv, wt.t(&format!("{p}.attn.qkv.weight")),
@@ -1319,9 +1134,6 @@ fn hab(a: &mut Acts, wt: &Weights, plan: &Plan, stage: usize, block: usize) {
                      &mut a.win_out, nw, wq, wt.heads, wt.head_dim, scale, shifted);
     linear(&a.win_out, &mut a.tok2, wt.t(&format!("{p}.attn.proj.weight")),
            wt.t(&format!("{p}.attn.proj.bias")), c, c, nw * wq);
-    // AFTER the projection, because that is what the reference's hook on the
-    // `attn` module captures: `WindowAttention.forward` ends `x = self.proj(x)`.
-    dump::write(&format!("{}_attn", dump::stem(&p)), &[nw, wq, c], &a.tok2[..nw * wq * c]);
     scatter_windows(&a.tok2, idx, &mut a.plane, c, plan.win, hw);
     // x = shortcut + attn + conv_x * conv_scale, in that order. `scatter_windows`
     // WRITES `a.plane`, it does not accumulate into it - so when it returns, `plane`
@@ -1333,25 +1145,24 @@ fn hab(a: &mut Acts, wt: &Weights, plan: &Plan, stage: usize, block: usize) {
     add_scaled(&mut a.plane, &a.plane2, 1.0);
     add_scaled(&mut a.plane, &a.mid_plane, wt.conv_scale);
 
-    dump::plane(&format!("{}_pre_mlp", dump::stem(&p)), &a.plane, c, h, w);
     // x = x + mlp(norm2(x)).
     to_tokens(&a.plane, &mut a.tok, c, hw);
     layer_norm(&mut a.tok, wt.t(&format!("{p}.norm2.weight")),
                wt.t(&format!("{p}.norm2.bias")), c, hw, 1e-5);
-    dump::tokens(&format!("{}_norm2", dump::stem(&p)), &a.tok, c, h, w);
+
     let hidden = wt.mlp_ratio * c;
     linear(&a.tok, &mut a.hidden, wt.t(&format!("{p}.mlp.fc1.weight")),
            wt.t(&format!("{p}.mlp.fc1.bias")), c, hidden, hw);
-    dump::write(&format!("{}_mlp_fc1", dump::stem(&p)), &[hw, hidden], &a.hidden[..hw * hidden]);
+
     for v in a.hidden.iter_mut() {
         *v = gelu(*v);
     }
     linear(&a.hidden, &mut a.tok2, wt.t(&format!("{p}.mlp.fc2.weight")),
            wt.t(&format!("{p}.mlp.fc2.bias")), hidden, c, hw);
-    dump::tokens(&format!("{}_mlp", dump::stem(&p)), &a.tok2, c, h, w);
+
     to_plane(&a.tok2, &mut a.plane2, c, hw);
     add_scaled(&mut a.plane, &a.plane2, 1.0);
-    dump::plane(&dump::stem(&p), &a.plane, c, h, w);
+
 }
 
 /// The OCAB as its own block, with the reference's residual: `proj(x) + shortcut`
@@ -1371,7 +1182,7 @@ fn ocab_block(a: &mut Acts, wt: &Weights, plan: &Plan, stage: usize) {
     to_tokens(&a.plane, &mut a.tok, c, hw);
     layer_norm(&mut a.tok, wt.t(&format!("{p}.norm2.weight")),
                wt.t(&format!("{p}.norm2.bias")), c, hw, 1e-5);
-    dump::tokens(&format!("{}_norm2", dump::stem(&p)), &a.tok, c, plan.hp, plan.wp);
+
     let hidden = wt.mlp_ratio * c;
     linear(&a.tok, &mut a.hidden, wt.t(&format!("{p}.mlp.fc1.weight")),
            wt.t(&format!("{p}.mlp.fc1.bias")), c, hidden, hw);
@@ -1380,10 +1191,10 @@ fn ocab_block(a: &mut Acts, wt: &Weights, plan: &Plan, stage: usize) {
     }
     linear(&a.hidden, &mut a.tok2, wt.t(&format!("{p}.mlp.fc2.weight")),
            wt.t(&format!("{p}.mlp.fc2.bias")), hidden, c, hw);
-    dump::tokens(&format!("{}_mlp", dump::stem(&p)), &a.tok2, c, plan.hp, plan.wp);
+
     to_plane(&a.tok2, &mut a.plane2, c, hw);
     add_scaled(&mut a.plane, &a.plane2, 1.0);
-    dump::plane(&dump::stem(&p), &a.plane, c, plan.hp, plan.wp);
+
 }
 
 /// One RHAG: `patch_embed(conv(patch_unembed(atten_blocks(x)))) + x`, where the
@@ -1394,7 +1205,6 @@ fn ocab_block(a: &mut Acts, wt: &Weights, plan: &Plan, stage: usize) {
 /// `plane2` before the conv overwrites it - so the input is copied to `qplane` first.
 fn rhag(a: &mut Acts, wt: &Weights, plan: &Plan, stage: usize) {
     let c = wt.embed;
-    let hw = plan.tokens();
     let (h, w) = (plan.hp, plan.wp);
     // The RHAG's residual base. It goes in `resi` and NOT in `qplane`/`plane2`:
     // those are scratch that every HAB's attention and the OCAB overwrite, so
@@ -1411,12 +1221,7 @@ fn rhag(a: &mut Acts, wt: &Weights, plan: &Plan, stage: usize) {
             wt.t(&format!("layers.{stage}.conv.bias")), c, c, h, w, false);
     a.plane.copy_from_slice(&a.hidden_plane);
     add_scaled(&mut a.plane, &a.resi, 1.0);        // + x
-    dump::plane(&format!("layers_{stage}_conv"), &a.hidden_plane, c, h, w);
-    dump::tokens(&format!("layers_{stage}"), &{
-        let mut t = vec![0.0f32; hw * c];
-        to_tokens(&a.plane, &mut t, c, hw);
-        t
-    }, c, h, w);
+
 }
 
 /// The head: `conv_before_upsample` (3x3 + LeakyReLU 0.01), one 3x3 conv and an
@@ -1437,7 +1242,7 @@ fn head(a: &mut Acts, wt: &Weights, plan: &Plan, y: &mut Vec<f32>) {
     let mut next = vec![0.0f32; feat * hw];
     conv3x3(&a.plane, &mut cur, wt.t("conv_before_upsample.0.weight"),
             wt.t("conv_before_upsample.0.bias"), c, feat, h, w, false);
-    dump::plane("conv_before_upsample", &cur, feat, h, w);
+
     for v in cur.iter_mut() {
         if *v < 0.0 { *v *= 0.01; }
     }
@@ -1462,9 +1267,6 @@ fn head(a: &mut Acts, wt: &Weights, plan: &Plan, y: &mut Vec<f32>) {
     let mut out = vec![0.0f32; 3 * hh * ww];
     conv3x3(&cur, &mut out, wt.t("conv_last.weight"), wt.t("conv_last.bias"),
             ch, 3, hh, ww, false);
-    // AFTER the conv: the reference's hook sits on the `conv_last` module, so the
-    // tensor it captures is the 3-channel output, not the 64-channel input.
-    dump::plane("conv_last", &out, 3, hh, ww);
     *y = out;
 }
 
@@ -1481,7 +1283,6 @@ fn head(a: &mut Acts, wt: &Weights, plan: &Plan, y: &mut Vec<f32>) {
 /// `Upsample` chain) and 3 (the single scale-3 block); both come from
 /// `Weights::up_blocks()` rather than from the call site.
 fn pixel_shuffle(src: &[f32], dst: &mut [f32], c: usize, h: usize, w: usize, r: usize) {
-    let _t = prof::t(prof::HEAD);
     let (ow, oh) = (w * r, h * r);
     let shw = h * w;
     let dhw = oh * ow;
@@ -1520,15 +1321,9 @@ fn forward_planes(a: &mut Acts, wt: &Weights, plan: &Plan) -> Result<(), String>
     let hw = plan.tokens();
 
     // conv_first reads the 3-CHANNEL padded plane in `a.plane` and widens it to c.
-    // The dump has to come FIRST: once `a.plane` has been re-laid out at c channels
-    // below, a 3-channel slice of it is some other tensor's first rows. (It used to
-    // sit after the conv and happened to be right only because the buffer reuse was
-    // one line further down.)
-    dump::plane("input", &a.plane, 3, h, w);
     a.hidden_plane.resize(hw * c, 0.0);
     conv3x3(&a.plane, &mut a.hidden_plane, wt.t("conv_first.weight"), wt.t("conv_first.bias"),
             3, c, h, w, false);
-    dump::plane("conv_first", &a.hidden_plane, c, h, w);
     a.body.resize(hw * c, 0.0);
     a.body.copy_from_slice(&a.hidden_plane);   // the body residual, kept all forward
     a.plane.resize(hw * c, 0.0);
@@ -1543,7 +1338,7 @@ fn forward_planes(a: &mut Acts, wt: &Weights, plan: &Plan) -> Result<(), String>
     to_tokens(&a.plane, &mut a.tok, c, hw);
     layer_norm(&mut a.tok, wt.t("patch_embed.norm.weight"), wt.t("patch_embed.norm.bias"),
                c, hw, 1e-5);
-    dump::tokens("patch_embed_norm", &a.tok, c, h, w);
+
     to_plane(&a.tok, &mut a.plane, c, hw);
 
     for stage in 0..wt.depths.len() {
@@ -1559,7 +1354,7 @@ fn forward_planes(a: &mut Acts, wt: &Weights, plan: &Plan) -> Result<(), String>
     // conv_after_body + the conv_first residual.
     conv3x3(&a.plane, &mut a.hidden_plane, wt.t("conv_after_body.weight"),
             wt.t("conv_after_body.bias"), c, c, h, w, false);
-    dump::plane("conv_after_body", &a.hidden_plane, c, h, w);
+
     a.plane.copy_from_slice(&a.hidden_plane);
     // The residual is `a.body`, which has held conv_first's output since the top of
     // this function - NOT `tok2`, which the blocks reuse as scratch.
@@ -1588,6 +1383,10 @@ impl<'a> Backend for Cpu<'a> {
         let plan = pre.plan.clone();
         let adjust = pre.adjust(self.wt, input);
         if self.plan.as_ref() != Some(&plan) {
+            // THE GUARD SITS AT THE ALLOCATION, so a tiled run checks the TILE's
+            // footprint rather than the image's - which is the case where memory is
+            // tight and the case `--mem` exists for. See `memguard`.
+            crate::memguard::check_cpu(self.wt, h, w)?;
             self.acts = Some(Acts::new(&plan, self.wt.mlp_ratio));
             self.plan = Some(plan.clone());
         }
@@ -1598,7 +1397,7 @@ impl<'a> Backend for Cpu<'a> {
         forward_planes(acts, self.wt, &plan)?;
         let out = std::mem::take(&mut acts.out_plane);
         let r = finish(self.wt, &plan, &out);
-        prof::report();
+
         Ok(r)
     }
 }

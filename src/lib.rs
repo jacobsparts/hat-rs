@@ -21,14 +21,13 @@
 //! backend that matches the other backend proves only that they share a mistake.
 //! `--cuda-selftest` then checks each launched kernel against a host twin (see
 //! `selftest.rs`), which is the only thing that catches a kernel whose result is
-//! merely plausible: the four project kernels that do not exist in the toolkit all
-//! take long shape argument lists, and a mis-ordered argument produces a plausible
-//! image rather than a fault.
+//! merely plausible: the project kernels in `cuda/hat.cu` take long shape argument
+//! lists, and a mis-ordered argument produces a plausible image rather than a fault.
 pub mod backend;
 pub mod cpu;
-pub mod dump;
 pub mod fixture;
 pub mod image;
+pub mod memguard;
 pub mod plan;
 pub mod tile;
 pub mod weights;

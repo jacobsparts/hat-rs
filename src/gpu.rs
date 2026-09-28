@@ -44,7 +44,6 @@ use lightgpu::vm::DevBuf;
 
 use crate::backend::{finish, Backend, Pre};
 use crate::cuda::{self, Cuda};
-use crate::dump;
 use crate::plan::Plan;
 use crate::weights::Weights;
 
@@ -121,7 +120,6 @@ struct Acts {
     /// gathered `[nw*owin*owin][2c]` key/value windows, their k and v halves, and the
     /// attention's output.
     oq: DevBuf,
-    okv: DevBuf,
     okw: DevBuf,
     ovv: DevBuf,
     oout: DevBuf,
@@ -158,8 +156,50 @@ struct Acts {
     out: DevBuf,
 }
 
-impl Acts {
-    fn new(wt: &Weights, plan: &Plan) -> Result<Acts, String> {
+/// The float count of every device buffer an `Acts` holds at a given plan.
+///
+/// ONE LIST, TWO USES: `Acts::new` allocates from it and [`footprint_floats`] sums
+/// it for the memory guard, so the number the guard refuses on cannot drift from
+/// the number that gets allocated. A second list would be a second opinion, and the
+/// two would agree right up until the buffer set changed - which is the one moment
+/// the guard has to be right.
+struct Sizes {
+    plane: usize,
+    plane2: usize,
+    body: usize,
+    n1: usize,
+    resi: usize,
+    conv_x: usize,
+    mlp: usize,
+    qkv: usize,
+    qp: usize,
+    kvp: usize,
+    cab_mid: usize,
+    pooled: usize,
+    seqh: usize,
+    gate: usize,
+    win: usize,
+    qkvw: usize,
+    qw: usize,
+    kw: usize,
+    vw: usize,
+    wout: usize,
+    oq: usize,
+    okw: usize,
+    ovv: usize,
+    oout: usize,
+    bias: usize,
+    lsa: usize,
+    loca: usize,
+    idx_sa: usize,
+    idx_oca: usize,
+    h0: usize,
+    h1: usize,
+    out: usize,
+}
+
+impl Sizes {
+    fn new(wt: &Weights, plan: &Plan) -> Sizes {
         let c = wt.embed;
         let hw = plan.tokens();
         let (nw, wq, wk) = (plan.nw(), plan.wq(), plan.wk());
@@ -189,39 +229,99 @@ impl Acts {
             pw *= r;
             widest = widest.max(widened);
         }
-        let z = |n: usize| DevBuf::zeros(n * 4);
-        let plane = |n: usize| z(c * n);
-        Ok(Acts {
-            plane: plane(hw)?,
-            plane2: plane(hw)?,
-            body: plane(hw)?,
-            n1: plane(hw)?,
-            resi: plane(hw)?,
-            conv_x: plane(hw)?,
-            mlp: z(wt.mlp_ratio * c * hw)?,
-            qkv: plane(3 * hw)?,
-            qp: plane(hw)?,
-            kvp: z(2 * c * hw)?,
-            cab_mid: plane(hw)?,
-            pooled: z(c)?,
-            seqh: z(c)?,
-            gate: z(c)?,
-            win: z(nt * c)?,
-            qkvw: z(nt * 3 * c)?,
-            qw: z(nt * c)?,
-            kw: z(nt * c)?,
-            vw: z(nt * c)?,
-            wout: z(nt * c)?,
-            oq: z(nt * c)?,
-            okv: z(nw * wk * 2 * c)?,
-            okw: z(nw * wk * c)?,
-            ovv: z(nw * wk * c)?,
-            oout: z(nt * c)?,
+        Sizes {
+            plane: c * hw,
+            plane2: c * hw,
+            body: c * hw,
+            n1: c * hw,
+            resi: c * hw,
+            conv_x: c * hw,
+            mlp: wt.mlp_ratio * c * hw,
+            qkv: 3 * c * hw,
+            qp: c * hw,
+            kvp: 2 * c * hw,
+            cab_mid: c * hw,
+            pooled: c,
+            seqh: c,
+            gate: c,
+            win: nt * c,
+            qkvw: nt * 3 * c,
+            qw: nt * c,
+            kw: nt * c,
+            vw: nt * c,
+            wout: nt * c,
+            oq: nt * c,
+            okw: nw * wk * c,
+            ovv: nw * wk * c,
+            oout: nt * c,
             // SIZED FOR BOTH ATTENTIONS: the HAB's is `[heads][wq][wq]` and the
             // OCAB's `[heads][wq][wk]`, and `wk = owin^2 = 576 > wq = 256`.
-            bias: z(wt.heads * wq * wk)?,
-            lsa: z(nw * plan.win * plan.win)?,
-            loca: z(nw * wk)?,
+            bias: wt.heads * wq * wk,
+            lsa: nw * plan.win * plan.win,
+            loca: nw * wk,
+            idx_sa: wq * wq,
+            idx_oca: wq * wk,
+            h0: feat * ph * pw,
+            h1: widest * ph_in * pw_in,
+            out: 3 * ph * pw,
+        }
+    }
+
+    /// The float count of the whole set. Counted as floats rather than bytes because
+    /// every buffer is f32 or i32, so the two are the same size and `total() * 4` is
+    /// the byte figure the guard compares.
+    fn total(&self) -> u64 {
+        let all = [
+            self.plane, self.plane2, self.body, self.n1, self.resi, self.conv_x,
+            self.mlp, self.qkv, self.qp, self.kvp, self.cab_mid, self.pooled,
+            self.seqh, self.gate, self.win, self.qkvw, self.qw, self.kw, self.vw,
+            self.wout, self.oq, self.okw, self.ovv, self.oout, self.bias,
+            self.lsa, self.loca, self.idx_sa, self.idx_oca, self.h0, self.h1, self.out,
+        ];
+        all.iter().map(|n| *n as u64).sum()
+    }
+}
+
+/// The device bytes a forward at this plan allocates, with NO device access: this is
+/// what `memguard` refuses on, and it has to answer before anything is allocated -
+/// including before a context exists.
+pub fn footprint_floats(wt: &Weights, plan: &Plan) -> u64 {
+    Sizes::new(wt, plan).total()
+}
+
+impl Acts {
+    fn new(wt: &Weights, plan: &Plan) -> Result<Acts, String> {
+        let s = Sizes::new(wt, plan);
+        let (wq, wk) = (plan.wq(), plan.wk());
+        let z = |n: usize| DevBuf::zeros(n * 4);
+        Ok(Acts {
+            plane: z(s.plane)?,
+            plane2: z(s.plane2)?,
+            body: z(s.body)?,
+            n1: z(s.n1)?,
+            resi: z(s.resi)?,
+            conv_x: z(s.conv_x)?,
+            mlp: z(s.mlp)?,
+            qkv: z(s.qkv)?,
+            qp: z(s.qp)?,
+            kvp: z(s.kvp)?,
+            cab_mid: z(s.cab_mid)?,
+            pooled: z(s.pooled)?,
+            seqh: z(s.seqh)?,
+            gate: z(s.gate)?,
+            win: z(s.win)?,
+            qkvw: z(s.qkvw)?,
+            qw: z(s.qw)?,
+            kw: z(s.kw)?,
+            vw: z(s.vw)?,
+            wout: z(s.wout)?,
+            oq: z(s.oq)?,
+            okw: z(s.okw)?,
+            ovv: z(s.ovv)?,
+            oout: z(s.oout)?,
+            bias: z(s.bias)?,
+            lsa: z(s.lsa)?,
+            loca: z(s.loca)?,
             // THE INDEX MAPS ARE BUILT HERE, not gathered with the bias. They depend
             // only on the window geometry and the tables' ROW COUNTS, both of which this
             // constructor has, and every block of a given kind shares them; the TABLES
@@ -232,23 +332,24 @@ impl Acts {
             idx_oca: cuda::upload_i32(&wrap_i64(wt, "relative_position_index_OCA",
                                                 "layers.0.residual_group.overlap_attn.relative_position_bias_table",
                                                 wq * wk))?,
-            h0: z(feat * ph * pw)?,
-            h1: z(widest * ph_in * pw_in)?,
-            out: z(3 * ph * pw)?,
+            h0: z(s.h0)?,
+            h1: z(s.h1)?,
+            out: z(s.out)?,
         })
     }
 
-    /// The floats this holds - the GPU twin of `cpu::Acts::footprint`, so the two
-    /// backends' footprints are comparable and `--mem` means the same thing on both.
-    /// The index maps do NOT shrink with a tile, which is why they are counted.
+    /// The floats the buffers ACTUALLY hold, summed over the allocation - the
+    /// measurement [`footprint_floats`] is held against, so that the number the guard
+    /// refuses on is the number that exists.
     fn footprint(&self) -> u64 {
         let f = |b: &DevBuf| (b.bytes / 4) as u64;
         [
             &self.plane, &self.plane2, &self.body, &self.n1, &self.resi, &self.conv_x,
             &self.mlp, &self.qkv, &self.qp, &self.kvp, &self.cab_mid, &self.pooled,
             &self.seqh, &self.gate, &self.win, &self.qkvw, &self.qw, &self.kw, &self.vw,
-            &self.wout, &self.oq, &self.okv, &self.okw, &self.ovv, &self.oout, &self.bias,
-            &self.lsa, &self.loca, &self.h0, &self.h1, &self.out,
+            &self.wout, &self.oq, &self.okw, &self.ovv, &self.oout, &self.bias,
+            &self.lsa, &self.loca, &self.idx_sa, &self.idx_oca, &self.h0, &self.h1,
+            &self.out,
         ]
         .iter()
         .map(|b| f(b))
@@ -271,6 +372,7 @@ impl<'a> Gpu<'a> {
     pub fn new(wt: &'a Weights) -> Result<Gpu<'a>, String> {
         let cuda = Cuda::new()?;
         cuda::available(&cuda)?;
+        crate::memguard::check_gpu_weights(wt)?;
         let mut w = HashMap::new();
         for name in &wt.names {
             if name.ends_with("relative_position_index_SA")
@@ -291,42 +393,6 @@ impl<'a> Gpu<'a> {
 
     fn plan(&self) -> &Plan {
         &self.acts.as_ref().expect("acts are installed").0
-    }
-
-    /// Write a device buffer as one of the reference's module-named activations.
-    ///
-    /// `HAT_RS_DUMP=<dir>` then makes both backends write the SAME names, so a
-    /// divergence between them is localised by comparing files rather than by
-    /// bisecting the output image: run the CPU backend into one directory and the GPU
-    /// into another and diff the sorted file list. THIS IS HOW THE FIRST FEW GPU
-    /// DISAGREEMENTS WERE FOUND, and it is the reason `dump` is a shared module
-    /// rather than a private part of `cpu.rs`.
-    ///
-    /// It costs one `OnceLock` lookup per call when the variable is unset, and a
-    /// device-to-host copy only when it is set.
-    fn snap(&self, name: &str, buf: &DevBuf, dims: &[usize]) {
-        // THE GATE COMES FIRST. `download` is a synchronous device copy, so
-        // downloading an activation only to have `dump::write` discard it flushes the
-        // pipeline at every dump point - about thirty per forward, worth roughly
-        // 300 ms of a 467 ms pass on the 1080.
-        if !dump::enabled() {
-            return;
-        }
-        let n: usize = dims.iter().product();
-        if n * 4 > buf.bytes {
-            eprintln!("gpu dump: {name}: {dims:?} needs {n} floats, buffer has {}", buf.bytes / 4);
-            return;
-        }
-        let mut host = vec![0.0f32; n];
-        if buf.download(&mut host).is_err() {
-            return;
-        }
-        dump::write(name, dims, &host);
-    }
-
-    /// A plane, `[c][h][w]`, at a reference module path.
-    fn snap_plane(&self, path: &str, buf: &DevBuf, c: usize, h: usize, w: usize) {
-        self.snap(&format!("{}_gpu", dump::stem(path)), buf, &[c, h, w]);
     }
 
     // -----------------------------------------------------------------------
@@ -386,7 +452,6 @@ impl<'a> Gpu<'a> {
         let hw = self.plan().tokens();
         self.cuda.channel_layer_norm(&a.plane, self.d(&format!("{p}.norm2.weight")),
                                      self.d(&format!("{p}.norm2.bias")), &a.n1, c, hw, EPS)?;
-        self.snap_plane(&format!("{p}_norm2"), &a.n1, c, self.plan().hp, self.plan().wp);
         // `fc1`: `[hid][c]` weights, `ne0 = c`, `ne1 = hid`. THE OUTPUT PLANE IS THE
         // `[hid][hw]` THAT `fc2` READS: `fc2`'s weights are `[c][hid]`, so its
         // `ne0 = hid` is the same matrix and its columns are the same pixels - which is
@@ -394,7 +459,6 @@ impl<'a> Gpu<'a> {
         // backend.
         self.cuda.conv1x1_rb(&a.n1, &a.mlp, self.d(&format!("{p}.mlp.fc1.weight")),
                              self.d(&format!("{p}.mlp.fc1.bias")), c, hid, hw)?;
-        self.snap_plane(&format!("{p}_mlp_fc1"), &a.mlp, hid, 1, hw);
         self.cuda.gelu(&a.mlp, &a.mlp, hid * hw)?;
         self.cuda.conv1x1_rb(&a.mlp, &a.plane2, self.d(&format!("{p}.mlp.fc2.weight")),
                              self.d(&format!("{p}.mlp.fc2.bias")), hid, c, hw)?;
@@ -419,10 +483,8 @@ impl<'a> Gpu<'a> {
         // axis, which is the reduction the reference performs on `[b, h*w, c]`.
         self.cuda.channel_layer_norm(&a.plane, self.d(&format!("{p}.norm1.weight")),
                                      self.d(&format!("{p}.norm1.bias")), &a.n1, c, hw, EPS)?;
-        self.snap_plane(&format!("{p}_norm1"), &a.n1, c, h, w);
         // The CAB reads the NORMED plane, so it runs before `n1` is reused.
         self.cab(a, &a.n1, &a.conv_x, &format!("{p}.conv_block"), h, w)?;
-        self.snap_plane(&format!("{p}_conv_block"), &a.conv_x, c, h, w);
         // The attention's windows come from the normed plane, rolled by `-shift` for
         // the odd blocks (the gather folds the roll into its index map).
         self.cuda.window_gather(&a.n1, &a.win, nw, wq, nx, plan.win, h, w, c, shift, 0)?;
@@ -449,16 +511,12 @@ impl<'a> Gpu<'a> {
                          self.d(&format!("{p}.attn.proj.bias")), c, c, nt)?;
         // AFTER the projection, to match the CPU and the reference's own hook on the
         // `attn` module: `WindowAttention.forward` ends `x = self.proj(x)`.
-        self.snap(&format!("{}_attn", dump::stem(&p)), &a.win, &[nw, wq, c]);
         // The scatter writes the plane, so the sum is explicit and in the reference's
         // order: `x = shortcut + attn + conv_x * conv_scale`.
         self.cuda.window_scatter(&a.win, &a.plane2, nw, wq, nx, plan.win, h, w, c, shift, 0)?;
         self.cuda.add_scaled(&a.plane, &a.plane2, &a.plane2, 1.0, c * hw)?;
         self.cuda.add_scaled(&a.plane2, &a.conv_x, &a.plane, self.wt.conv_scale, c * hw)?;
-        self.snap_plane(&format!("{p}_pre_mlp"), &a.plane, c, h, w);
-        self.mlp(a, &p);
-        self.snap_plane(&dump::stem(&p), &a.plane, c, h, w);
-        Ok(())
+        self.mlp(a, &p)
     }
 
     /// The OCAB - `OverlapCrossAttention.forward`, whose shapes had to be read off the
@@ -484,7 +542,6 @@ impl<'a> Gpu<'a> {
 
         self.cuda.channel_layer_norm(&a.plane, self.d(&format!("{p}.norm1.weight")),
                                      self.d(&format!("{p}.norm1.bias")), &a.n1, c, hw, EPS)?;
-        self.snap_plane(&format!("{p}_norm1"), &a.n1, c, h, w);
         // ONE fused GEMM over the normed plane, then its bias: the reference's
         // `qkv = self.qkv(x)` on the plane, which is why the GEMM form applies here and
         // the token form (`lg_linear`) applies to the HAB's windowed qkv.
@@ -519,31 +576,15 @@ impl<'a> Gpu<'a> {
         // routes agree - the labels are what this engine would need if a checkpoint ever
         // gave a padding row a large value.
         self.gather_bias_oca(a, &format!("{p}.relative_position_bias_table"))?;
-        // STAGE 0 ONLY. These names repeat once per stage and the last write wins,
-        // which silently compares the LAST stage - whose input has already diverged by
-        // the time anything is wrong. The first divergence is what matters.
-        if stage == 0 {
-            self.snap(&format!("{}_qkv", dump::stem(&p)), &a.qkv, &[hw, 3 * c]);
-            self.snap(&format!("{}_kvplane", dump::stem(&p)), &a.kvp, &[2 * c, h, w]);
-            self.snap(&format!("{}_qwin", dump::stem(&p)), &a.oq, &[nw, wq, c]);
-            self.snap(&format!("{}_kwin", dump::stem(&p)), &a.okw, &[nw, wk, c]);
-            self.snap(&format!("{}_vwin", dump::stem(&p)), &a.ovv, &[nw, wk, c]);
-        }
         self.cuda.attention(&a.oq, &a.okw, &a.ovv, Some(&a.bias), None, &a.oout,
                             nw, nx, wq, wk, self.wt.heads, d, scale, true, false)?;
-        if stage == 0 {
-            self.snap(&format!("{}_outwin", dump::stem(&p)), &a.oout, &[nw, wq, c]);
-        }
         self.cuda.linear(&a.oout, &a.win, self.d(&format!("{p}.proj.weight")),
                          self.d(&format!("{p}.proj.bias")), c, c, nt)?;
         self.cuda.window_scatter(&a.win, &a.plane2, nw, wq, nx, plan.win, h, w, c, 0, 0)?;
         // `x = x + proj(a)`, where `x` is the block's input - the same buffer the
         // `norm1` above read, which is why the norm wrote to `n1`.
         self.cuda.add(&a.plane, &a.plane2, &a.plane, c * hw)?;
-        self.snap_plane(&format!("{p}_proj"), &a.plane2, c, h, w);
-        self.mlp(a, &p);
-        self.snap_plane(&dump::stem(&p), &a.plane, c, h, w);
-        Ok(())
+        self.mlp(a, &p)
     }
 
     /// One RHAG: the stage's blocks, the overlapping block, then the stage's own 3x3
@@ -564,9 +605,7 @@ impl<'a> Gpu<'a> {
         self.cuda.conv3x3(&a.plane, &a.plane2, self.d(&format!("layers.{stage}.conv.weight")),
                           self.d(&format!("layers.{stage}.conv.bias")), c, c, h, w,
                           ACT_NONE, 0.0)?;
-        self.snap_plane(&format!("layers_{stage}_conv"), &a.plane2, c, h, w);
         self.cuda.add_scaled(&a.plane2, &a.resi, &a.plane, 1.0, c * hw)?;
-        self.snap_plane(&format!("layers_{stage}"), &a.plane, c, h, w);
         Ok(())
     }
 
@@ -608,16 +647,11 @@ impl<'a> Gpu<'a> {
             ph *= r;
             pw *= r;
         }
-        self.snap_plane("conv_before_upsample", &a.h0, feat, ph, pw);
         self.cuda.conv3x3(&a.h0, &a.out, self.d("conv_last.weight"), self.d("conv_last.bias"),
                           feat, 3, ph, pw, ACT_NONE, 0.0)?;
-        self.snap_plane("conv_last", &a.out, 3, ph, pw);
         Ok(())
     }
 
-    /// The device-side index maps: the shift mask's labels and the overlapping
-    /// attention's key labels. Both are `nw * win^2` (or `nw * owin^2`) i32 where the
-    /// reference materialises `nw * win^4` floats.
     /// Materialise `table[rpi]` as the `[heads][nq][nk]` addend the attention reads.
     ///
     /// THE TABLE IS A PER-BLOCK WEIGHT: every HAB and every OCAB has its own, all with
@@ -689,8 +723,6 @@ impl<'a> Gpu<'a> {
         // conv_first's output).
         self.cuda.conv3x3(&a.plane, &a.body, self.d("conv_first.weight"),
                           self.d("conv_first.bias"), 3, c, h, w, ACT_NONE, 0.0)?;
-        self.snap_plane("input", &a.plane, 3, h, w);
-        self.snap_plane("conv_first", &a.body, c, h, w);
         // `forward_features`: patch_embed is a reshape, then HAT's own
         // `patch_embed.norm`, the stages, and the final `self.norm` - both norms over
         // the channel axis.
@@ -701,7 +733,6 @@ impl<'a> Gpu<'a> {
         // wrong while looking plausible.
         self.cuda.channel_layer_norm(&a.body, self.d("patch_embed.norm.weight"),
                                      self.d("patch_embed.norm.bias"), &a.n1, c, hw, EPS)?;
-        self.snap_plane("patch_embed_norm", &a.n1, c, h, w);
         self.cuda.copy(&a.n1, &a.plane, c * hw)?;
         for stage in 0..self.wt.depths.len() {
             self.rhag(a, stage)?;
@@ -710,10 +741,8 @@ impl<'a> Gpu<'a> {
                                      &a.n1, c, hw, EPS)?;
         // `patch_unembed` (a reshape) then `conv_after_body`, and the conv_first
         // residual on top of it.
-        self.snap_plane("norm", &a.n1, c, h, w);
         self.cuda.conv3x3(&a.n1, &a.plane2, self.d("conv_after_body.weight"),
                           self.d("conv_after_body.bias"), c, c, h, w, ACT_NONE, 0.0)?;
-        self.snap_plane("conv_after_body", &a.plane2, c, h, w);
         // The residual lands back in `plane`, which the head reads - `h0` is only
         // `feat` = 64 wide and could not hold a `c`-channel plane.
         self.cuda.add_scaled(&a.plane2, &a.body, &a.plane, 1.0, c * hw)?;
@@ -738,7 +767,25 @@ impl Backend for Gpu<'_> {
             None => true,
         };
         if stale {
+            // The tile's footprint, not the image's: a tiled run calls this once per
+            // tile, so `--mem` and the guard are checking the same quantity.
+            crate::memguard::check_gpu(self.wt, h, w)?;
             let acts = Acts::new(self.wt, &plan)?;
+            // THE PREDICTION IS HELD TO THE ALLOCATION. `footprint_floats` is what
+            // the guard refused on and `footprint` is what the buffers actually
+            // hold; both come from `Sizes`, so a disagreement means the buffer set
+            // and the size list have drifted apart - the one failure mode that would
+            // make the guard quietly wrong, and the reason the two are summed by the
+            // same `total()` in the first place. A silent over-allocation is smaller
+            // than the rounding here; a missing buffer is not.
+            let derived = crate::gpu::footprint_floats(self.wt, &plan);
+            let actual = acts.footprint();
+            if actual != derived {
+                return Err(format!(
+                    "gpu: the buffer set does not match the guard's prediction at \
+                     {}x{}: allocated {actual} floats, predicted {derived}",
+                    h, w));
+            }
             self.acts = Some((plan.clone(), acts));
             let a = &self.acts.as_ref().unwrap().1;
             self.maps(a)?;
@@ -754,7 +801,6 @@ impl Backend for Gpu<'_> {
         let a = &self.acts.as_ref().unwrap().1;
         let mut host = vec![0.0f32; a.out.bytes / 4];
         a.out.download(&mut host)?;
-        crate::cuda::report();
         Ok(finish(self.wt, &plan, &host))
     }
 }
