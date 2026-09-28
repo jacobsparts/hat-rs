@@ -1,0 +1,40 @@
+[package]
+name = "hat"
+version = "0.1.0"
+edition = "2021"
+description = "Fast, self-contained HAT image super-resolution (S/M/L, x2/x3/x4) with CPU and CUDA backends"
+license = "MIT"
+repository = "https://github.com/jacobsparts/hat-rs"
+readme = "README.md"
+
+[[bin]]
+name = "hat"
+path = "src/main.rs"
+
+[features]
+# The default build supports both backends: `--device cpu` is pure Rust,
+# `--device gpu` uses the embedded CUDA fatbins. Building the CUDA feature needs
+# nvcc (set NVCC=/path/to/nvcc if it is not on PATH).
+default = ["cuda"]
+# Compiles cuda/hat.cu with nvcc and embeds the fatbins.
+cuda = []
+
+[dependencies]
+png = "0.17"
+# The CPU backend's parallelism. `--device cpu` is the path for a machine with no
+# usable GPU, so it is not an afterthought: see the "Parallelism" note at the top
+# of src/cpu.rs.
+rayon = "1.12"
+# Driver layer, module/launch/buffer plumbing, the safetensors reader and the
+# generic kernel set.
+lightgpu = { git = "https://github.com/jacobsparts/lightgpu.git" }
+
+[build-dependencies]
+# Compiles this engine's kernel family and the toolkit subset it calls.
+lightgpu-build = { git = "https://github.com/jacobsparts/lightgpu.git", package = "lightgpu-build" }
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 4
+panic = "abort"

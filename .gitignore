@@ -1,0 +1,17 @@
+/target
+
+Cargo.lock
+
+# The checkpoints the engine reads are converted .safetensors files; the upstream
+# .pth originals are large and are not part of this project. See the README.
+*.pth
+/models
+/target
+
+# Python: tools/ has four scripts, and running them leaves bytecode behind.
+__pycache__/
+*.pyc
+
+# The fixtures are checked in (they are the correctness record); the per-stage
+# dumps `--dump` writes while chasing a divergence are not.
+tests/data/stages/
